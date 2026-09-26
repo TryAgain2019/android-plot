@@ -121,7 +121,11 @@
     rightPriceScale: { borderColor: COLORS.line, borderVisible: true, minimumWidth: 52, entireTextOnly: true },
     timeScale: {
       borderColor: COLORS.line,
-      rightOffset: 12,
+      // The newest bar stays against the price axis: no empty space after it, and zooming keeps
+      // the right edge where it is instead of zooming around the fingers.
+      rightOffset: 0,
+      fixRightEdge: true,
+      rightBarStaysOnScroll: true,
       barSpacing: 6,
       minBarSpacing: 0.4,
       timeVisible: false,
@@ -168,7 +172,6 @@
     crosshairMarkerVisible: false,
     priceLineVisible: false,
     lastValueVisible: true,
-    title: 'Open Interest',
     priceFormat: oiFormat,
   }, 1);
 
@@ -181,7 +184,6 @@
       priceLineVisible: false,
       lastValueVisible: true,
       crosshairMarkerVisible: false,
-      title: ex.name,
       priceFormat: fundingFormat,
     }, 2);
   }
@@ -202,7 +204,8 @@
   if (window.ResizeObserver) new ResizeObserver(applyPaneLayout).observe(chartEl);
   chart.priceScale('right', 0).applyOptions({ scaleMargins: { top: 0.09, bottom: 0.05 } });
   chart.priceScale('right', 1).applyOptions({ scaleMargins: { top: 0.2, bottom: 0.08 } });
-  chart.priceScale('right', 2).applyOptions({ scaleMargins: { top: 0.2, bottom: 0.08 } });
+  // Room at the top for the two-line funding legend.
+  chart.priceScale('right', 2).applyOptions({ scaleMargins: { top: 0.3, bottom: 0.08 } });
 
   // ---------------------------------------------------------------- state
 
@@ -277,8 +280,9 @@
     }).join('');
   }
 
-  // Line 1: title (+ change for price) and loading state. Line 2, only while the crosshair is
-  // shown: the values of the bar under it.
+  // Line 1: title (+ change for price) and loading state. Line 2: the values of the bar under the
+  // crosshair; for funding always shown (latest values otherwise), since the exchange names are
+  // not on the axis labels.
   function updateLegends() {
     const hovering = state.hover !== null;
 
@@ -305,14 +309,12 @@
 
     // funding
     line2 = '';
-    if (hovering) {
-      for (const key of LEGEND_ORDER) {
-        const ex = EXCHANGES.find(e => e.key === key);
-        if (!state.settings.funding[key]) continue;
-        const arr = state.funding[key] || [];
-        const i = barAt(arr, state.hover);
-        if (i >= 0) line2 += `<span class="k">${ex.name}</span><span style="color:${ex.color}">${fmtFunding(arr[i].value)}</span>`;
-      }
+    for (const key of LEGEND_ORDER) {
+      const ex = EXCHANGES.find(e => e.key === key);
+      if (!state.settings.funding[key]) continue;
+      const arr = state.funding[key] || [];
+      const i = hovering ? barAt(arr, state.hover) : arr.length - 1;
+      if (i >= 0) line2 += `<span class="k">${ex.name}</span><span style="color:${ex.color}">${fmtFunding(arr[i].value)}</span>`;
     }
     legends[2].innerHTML = legendHtml('<span class="title">Cross Exchange Funding</span>' + busyText('funding'), line2);
   }
@@ -339,7 +341,7 @@
     b.dataset.tf = tf.code;
     b.addEventListener('click', () => {
       if (tf.code === state.tf.code && state.price.length) {
-        chart.timeScale().scrollToRealTime();
+        scrollToLatest();
         return;
       }
       selectTimeframe(tf.code);
@@ -356,9 +358,15 @@
     if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
+  // Jumps to the newest bar. Not the library's animated scrollToRealTime(): its animation can
+  // stop a bar short of the end, leaving the newest candle cut off at the edge.
+  function scrollToLatest() {
+    chart.timeScale().scrollToPosition(0, false);
+  }
+
   const realtimeBtn = document.getElementById('realtime');
   realtimeBtn.addEventListener('click', () => {
-    chart.timeScale().scrollToRealTime();
+    scrollToLatest();
     chart.priceScale('right', 0).applyOptions({ autoScale: true });
     chart.priceScale('right', 1).applyOptions({ autoScale: true });
     chart.priceScale('right', 2).applyOptions({ autoScale: true });
@@ -478,17 +486,15 @@
     return true;
   }
 
-  // Like the reference: about six months of daily bars with empty space on the right for the
-  // axis labels. On a narrow (portrait) screen fewer bars are shown so candles stay readable.
+  // Like the reference: about six months of daily bars, ending at the price axis. On a narrow
+  // (portrait) screen fewer bars are shown so candles stay readable.
   function applyInitialView() {
     const n = state.price.length;
     const width = chart.timeScale().width() || chartEl.clientWidth || 360;
-    const rightPx = Math.max(width * 0.18, 64);
     const minSpacing = state.tf.code === '1d' ? 1.9 : 3;
     const maxBars = state.tf.code === '1d' ? 180 : state.tf.code === '1w' ? 104 : state.tf.code === '1M' ? 60 : 130;
-    const visible = Math.max(30, Math.min(maxBars, Math.floor((width - rightPx) / minSpacing)));
-    const right = visible * rightPx / (width - rightPx);
-    chart.timeScale().setVisibleLogicalRange({ from: Math.max(-2, n - 1 - visible), to: n - 1 + right });
+    const visible = Math.max(30, Math.min(maxBars, Math.floor(width / minSpacing)));
+    chart.timeScale().setVisibleLogicalRange({ from: Math.max(-2, n - 1 - visible), to: n - 1 });
   }
 
   function onReset(msg) {

@@ -66,7 +66,35 @@ async function main() {
 
   const cdp = await page.context().newCDPSession(page);
   const range = () => page.evaluate(() => window.chartApp.chart.timeScale().getVisibleLogicalRange());
+  // Empty space after the newest bar, in bars (0 = the last candle touches the price axis).
+  const gap = () => page.evaluate(() => {
+    const r = window.chartApp.chart.timeScale().getVisibleLogicalRange();
+    return Math.round((r.to - (window.chartApp.state.price.length - 1)) * 100) / 100;
+  });
   results.initialRange = await range();
+  results.gap = { initial: await gap() };
+
+  // Drag right-to-left (towards the future): must not open a gap.
+  await touch(cdp, 'touchStart', [[300, 300]]);
+  for (let i = 1; i <= 10; i++) await touch(cdp, 'touchMove', [[300 - i * 20, 300]]);
+  await touch(cdp, 'touchEnd', []);
+  await page.waitForTimeout(700);
+  results.gap.afterDragTowardsFuture = await gap();
+
+  // Pinch in near the right side, like zooming on the newest candles.
+  await touch(cdp, 'touchStart', [[250, 300], [290, 300]]);
+  for (let i = 1; i <= 10; i++) await touch(cdp, 'touchMove', [[250 - i * 8, 300], [290 + i * 4, 300]]);
+  await touch(cdp, 'touchEnd', []);
+  await page.waitForTimeout(400);
+  results.gap.afterZoomIn = await gap();
+  await page.screenshot({ path: path.join(outDir, 's21-zoomed-right.png') });
+
+  // Pinch out again.
+  await touch(cdp, 'touchStart', [[150, 300], [300, 300]]);
+  for (let i = 1; i <= 10; i++) await touch(cdp, 'touchMove', [[150 + i * 6, 300], [300 - i * 6, 300]]);
+  await touch(cdp, 'touchEnd', []);
+  await page.waitForTimeout(400);
+  results.gap.afterZoomOut = await gap();
 
   // Pan: drag right by 150px -> older bars come into view.
   await touch(cdp, 'touchStart', [[250, 300]]);
@@ -104,6 +132,23 @@ async function main() {
     app.receive({ type: 'funding', gen: 1, mode: 'live', series: { okx: [[last.time + 86400, 0.0041]] } });
   });
   results.afterLive = await page.evaluate(() => ({ n: window.chartApp.state.price.length, legend: document.querySelector('.legend').textContent }));
+  // Leave tracking mode, go back to the newest bar, then a new bar arrives: still no gap.
+  await page.tap('#info-btn');
+  await page.tap('#close-sheet');
+  results.realtimeButtonShown = await page.evaluate(() => getComputedStyle(document.getElementById('realtime')).display !== 'none');
+  await page.tap('#realtime');
+  await page.waitForTimeout(300);
+  results.gap.afterRealtimeButton = await gap();
+  results.realtimeButtonHidden = await page.evaluate(() => getComputedStyle(document.getElementById('realtime')).display === 'none');
+  await page.evaluate(() => {
+    const app = window.chartApp;
+    const last = app.state.price[app.state.price.length - 1];
+    app.receive({ type: 'price', gen: 1, mode: 'live', bars: [[last.time + 86400, last.close, last.close + 10, last.close - 10, last.close + 5]] });
+  });
+  await page.waitForTimeout(300);
+  results.gap.afterNewBar = await gap();
+  results.fundingLegend = await page.evaluate(() => document.querySelectorAll('.legend')[2].textContent);
+  await page.screenshot({ path: path.join(outDir, 's21-after-live.png') });
 
   // Prepend older history (lazy load) keeps the right edge anchored.
   const beforePrepend = await range();
