@@ -73,6 +73,13 @@ async function main() {
   });
   results.initialRange = await range();
   results.gap = { initial: await gap() };
+  // The funding pane's dashed zero line is within the pane.
+  results.zeroLine = await page.evaluate(() => {
+    const pane = window.chartApp.chart.panes()[2];
+    const series = pane.getSeries();
+    const y = series[0].priceToCoordinate(0);
+    return { inView: y !== null && y >= 0 && y <= pane.getHeight(), onEverySeries: series.every(s => s.priceLines().some(l => l.options().price === 0)) };
+  });
 
   // Drag right-to-left (towards the future): must not open a gap.
   await touch(cdp, 'touchStart', [[300, 300]]);

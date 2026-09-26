@@ -27,6 +27,7 @@
     oiLabel: '#22cf90',
     crosshair: '#80858f',
     crosshairLabel: '#3b3e46',
+    zeroLine: '#7a7a7a',
   };
 
   // Funding lines; drawn in this order (later ones on top).
@@ -176,6 +177,15 @@
   }, 1);
 
   const fundingFormat = { type: 'custom', minMove: 0.0001, formatter: fmtFunding, tickmarksFormatter: ps => ps.map(fmtFundingTick) };
+  // Keeps 0 inside the funding scale so the zero line is always in view.
+  const includeZero = original => {
+    const info = original();
+    if (info && info.priceRange) {
+      info.priceRange.minValue = Math.min(info.priceRange.minValue, 0);
+      info.priceRange.maxValue = Math.max(info.priceRange.maxValue, 0);
+    }
+    return info;
+  };
   for (const ex of EXCHANGES) {
     ex.series = chart.addSeries(L.LineSeries, {
       color: ex.color,
@@ -185,7 +195,19 @@
       lastValueVisible: true,
       crosshairMarkerVisible: false,
       priceFormat: fundingFormat,
+      autoscaleInfoProvider: includeZero,
     }, 2);
+    // Dashed zero line. Every funding series gets one (they draw on the same pixels) so it stays
+    // when some exchanges are switched off.
+    ex.series.createPriceLine({
+      price: 0,
+      color: COLORS.zeroLine,
+      lineWidth: 1,
+      lineStyle: L.LineStyle.Dashed,
+      lineVisible: true,
+      axisLabelVisible: false,
+      title: '',
+    });
   }
 
   // Pane heights as in the reference (about 62/18/18 %); short (landscape) screens give the lower
