@@ -312,7 +312,7 @@ class ControllerEndToEndTest {
     }
 
     @Test
-    fun hourlyFundingIsAveragedPerBar() {
+    fun hourlyFundingIsScaledToEightHours() {
         val gen = openOn("4h")
         waitFor("4h history") { loaded(gen) }
         val series = find("funding", "set", gen).last().getJSONObject("series")

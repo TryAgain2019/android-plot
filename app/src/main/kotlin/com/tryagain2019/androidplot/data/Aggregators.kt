@@ -102,7 +102,8 @@ object FundingAggregator {
     /**
      * Settlement i covers the interval since settlement i-1; its rate is scaled to 8 hours (so
      * Hyperliquid's hourly rate is multiplied by 8). The interval after the last settlement uses
-     * [live]. Each bar gets the time-weighted average over the part of it that has data.
+     * [live]. Each bar shows the rate in effect at its close, like a candle's close, so the bar in
+     * progress shows the current predicted rate on every timeframe.
      */
     fun build(
         tf: Timeframe,
@@ -119,20 +120,16 @@ object FundingAggregator {
         val lastBar = tf.barStart(now)
         var p = 0
         while (bar <= lastBar) {
-            val end = minOf(tf.nextBarStart(bar), now)
-            while (p < periods.size && periods[p].end <= bar) p++
-            var weighted = 0.0
-            var covered = 0L
-            var i = p
-            while (i < periods.size && periods[i].start < end) {
-                val overlap = minOf(end, periods[i].end) - maxOf(bar, periods[i].start)
-                if (overlap > 0) {
-                    weighted += periods[i].percentPer8h * overlap
-                    covered += overlap
-                }
-                i++
+            // The last moment of the bar that has already happened.
+            val close = minOf(tf.nextBarStart(bar), now) - 1
+            while (p < periods.size - 1 && periods[p].end < close) p++
+            val period = periods[p]
+            when {
+                close > period.start && close <= period.end -> out += Sample(bar, period.percentPer8h)
+                // No live rate yet (first poll pending): keep the last settled rate for a while.
+                p == periods.size - 1 && close > period.end && close - period.end < 2 * (period.end - period.start) ->
+                    out += Sample(bar, period.percentPer8h)
             }
-            if (covered > 0) out += Sample(bar, weighted / covered)
             bar = tf.nextBarStart(bar)
         }
         return out

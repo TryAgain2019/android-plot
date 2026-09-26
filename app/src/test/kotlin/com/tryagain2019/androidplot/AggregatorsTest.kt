@@ -101,7 +101,7 @@ class AggregatorsTest {
     }
 
     @Test
-    fun fundingDailyAverageOfEightHourRates() {
+    fun fundingBarsShowTheRateAtTheirClose() {
         val events = series(
             "2026-09-01T08:00:00Z" to 0.0001,
             "2026-09-01T16:00:00Z" to 0.0002,
@@ -110,8 +110,32 @@ class AggregatorsTest {
         )
         val points = FundingAggregator.build(Timeframe.D1, t("2026-09-01T00:00:00Z"), t("2026-09-02T08:00:00Z"), events, null, 8 * HOUR)
         assertEquals(2, points.size)
-        near(0.02, points[0].value) // mean of 0.01, 0.02, 0.03 (%)
+        near(0.03, points[0].value) // the period accruing at the end of 09-01 (16:00-24:00)
         near(-0.01, points[1].value)
+    }
+
+    @Test
+    fun latestFundingIsTheSameOnEveryTimeframe() {
+        // Settled rates vary through the day; the live predicted rate is 0.00004 (0.004 %/8h).
+        val events = series(
+            "2026-09-01T00:00:00Z" to 0.0002,
+            "2026-09-01T08:00:00Z" to 0.0001,
+        )
+        val live = LiveFunding(0.00004, t("2026-09-01T16:00:00Z"))
+        val now = t("2026-09-01T15:53:00Z")
+        for (tf in Timeframe.entries) {
+            val points = FundingAggregator.build(tf, t("2026-08-01T00:00:00Z"), now, events, live, 8 * HOUR)
+            near(0.004, points.last().value)
+            assertEquals(tf.barStart(now), points.last().time, tf.name)
+        }
+    }
+
+    @Test
+    fun beforeTheFirstLivePollTheLastSettledRateCarriesOn() {
+        val events = series("2026-09-01T00:00:00Z" to 0.0001, "2026-09-01T08:00:00Z" to 0.0002)
+        val points = FundingAggregator.build(Timeframe.H1, t("2026-09-01T06:00:00Z"), t("2026-09-01T09:30:00Z"), events, null, 8 * HOUR)
+        near(0.02, points.last().value)
+        assertEquals(t("2026-09-01T09:00:00Z"), points.last().time)
     }
 
     @Test

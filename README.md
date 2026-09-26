@@ -38,8 +38,9 @@ How the panes are computed:
   to 1 day apart, depending on the timeframe), summed at the same moments. That gives
   open/high/low/close for each bar, and the current bar also uses the live 5-second polls.
 - **Funding**: each settled rate is scaled to 8 hours (Hyperliquid pays hourly, so its rate × 8).
-  A bar shows the time-weighted average of the rates that accrued during it. The bar in progress
-  uses each exchange's current predicted rate.
+  A bar shows the rate in effect at its close, like a candle's close: the settled rate of the
+  funding period its last moment falls in, or each exchange's current predicted rate for the bar
+  in progress. So the latest value is the same on every timeframe.
 
 ### Loading speed
 
