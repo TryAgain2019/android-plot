@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Three candles (green / pink / green) inside the 66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:fillColor="#FF22CF90" android:pathData="M37,36h2v38h-2z" />
+    <path android:fillColor="#FF22CF90" android:pathData="M33,46h10v20h-10z" />
+    <path android:fillColor="#FFD72F6A" android:pathData="M53,30h2v48h-2z" />
+    <path android:fillColor="#FFD72F6A" android:pathData="M49,38h10v26h-10z" />
+    <path android:fillColor="#FF22CF90" android:pathData="M69,26h2v38h-2z" />
+    <path android:fillColor="#FF22CF90" android:pathData="M65,32h10v24h-10z" />
+</vector>
