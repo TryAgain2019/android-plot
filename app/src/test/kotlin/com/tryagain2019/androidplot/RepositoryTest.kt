@@ -2,6 +2,7 @@ package com.tryagain2019.androidplot
 
 import com.tryagain2019.androidplot.data.Fetched
 import com.tryagain2019.androidplot.data.FundingRepository
+import com.tryagain2019.androidplot.data.HistoryStore
 import com.tryagain2019.androidplot.data.LiveOiRecorder
 import com.tryagain2019.androidplot.data.OiRepository
 import com.tryagain2019.androidplot.model.Exchange
@@ -62,12 +63,39 @@ class RepositoryTest {
     @Test
     fun hyperliquidOpenInterestIsRecordedAcrossSessions() {
         val dir = tmp.newFolder()
-        val first = OiRepository(emptyMap(), LiveOiRecorder(dir))
+        val recorder = LiveOiRecorder(dir)
+        val first = OiRepository(emptyMap(), recorder)
         first.recordLive(10 * MINUTE, mapOf(Exchange.HYPERLIQUID to 30_000.0, Exchange.BINANCE to 1.0))
         first.recordLive(12 * MINUTE, mapOf(Exchange.HYPERLIQUID to 30_100.0)) // < 5 min later: not persisted
         first.recordLive(16 * MINUTE, mapOf(Exchange.HYPERLIQUID to 30_200.0))
-        val second = OiRepository(emptyMap(), LiveOiRecorder(dir))
-        assertEquals(mapOf(10 * MINUTE to 30_000.0, 16 * MINUTE to 30_200.0), second.samples(Exchange.HYPERLIQUID))
-        assertEquals(emptyMap(), second.samples(Exchange.BINANCE))
+        recorder.awaitWrites()
+        val loaded = LiveOiRecorder(dir).load()
+        assertEquals(listOf(Sample(10 * MINUTE, 30_000.0), Sample(16 * MINUTE, 30_200.0)), loaded[Exchange.HYPERLIQUID])
+        assertEquals(null, loaded[Exchange.BINANCE])
+    }
+
+    @Test
+    fun historySurvivesARestartThroughTheStore() = runBlocking {
+        val store = HistoryStore(tmp.newFolder())
+        val day = 24 * 60 * MINUTE
+        val repo = OiRepository(mapOf(Exchange.BYBIT to com.tryagain2019.androidplot.data.OiHistorySource { from, to, _, _, _, _ ->
+            Fetched(listOf(Sample(from - from % (4 * 60 * MINUTE), 1.0), Sample(to - to % (4 * 60 * MINUTE), 2.0)), from)
+        }))
+        repo.ensure(Exchange.BYBIT, 10 * day, 13 * day, Timeframe.D1, 13 * day)
+        repo.recordLive(13 * day + 1_234, mapOf(Exchange.BYBIT to 3.0)) // live point: kept, it is recent
+        store.writeSeries("oi-bybit", repo.snapshot(Exchange.BYBIT, 13 * day + 5_000))
+
+        val calls = ArrayList<Pair<Long, Long>>()
+        val next = OiRepository(mapOf(Exchange.BYBIT to com.tryagain2019.androidplot.data.OiHistorySource { from, to, _, _, _, _ ->
+            calls += from to to
+            Fetched(emptyList(), from)
+        }))
+        next.restore(Exchange.BYBIT, store.readSeries("oi-bybit")!!)
+        assertEquals(repo.samples(Exchange.BYBIT), next.samples(Exchange.BYBIT))
+        // Only the part after what was stored is fetched again.
+        next.ensure(Exchange.BYBIT, 10 * day, 14 * day, Timeframe.D1, 14 * day)
+        assertEquals(listOf(13 * day to 14 * day), calls)
+        // Old live points are dropped when saving.
+        assertEquals(false, next.snapshot(Exchange.BYBIT, 20 * day).points.containsKey(13 * day + 1_234))
     }
 }

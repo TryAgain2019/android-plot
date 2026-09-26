@@ -17,7 +17,9 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
@@ -54,6 +56,28 @@ class Pacer(private val minIntervalMs: Long) {
     }
 }
 
+/** Runs [block] for every item with at most [parallelism] calls in flight; results keep the items' order. */
+internal suspend fun <T, R> inParallel(items: List<T>, parallelism: Int, block: suspend (T) -> R): List<R> = coroutineScope {
+    val permits = Semaphore(parallelism)
+    items.map { item -> async { permits.withPermit { block(item) } } }.awaitAll()
+}
+
+/**
+ * Splits [from, to] into request windows of at most [span], newest first. At most [maxWindows] are
+ * returned; the second value is how far back they reach (> [from] when capped).
+ */
+internal fun windowsBackward(from: Long, to: Long, span: Long, maxWindows: Int): Pair<List<LongRange>, Long> {
+    val out = ArrayList<LongRange>()
+    var end = to
+    while (end >= from) {
+        if (out.size == maxWindows) return out to end
+        val start = maxOf(from, end - span)
+        out += start..end
+        end = start - 1
+    }
+    return out to from
+}
+
 /** Binance keeps 30 days of OI in its API; anything older comes from the daily archive files. */
 class BinanceOiHistory(private val api: BinanceApi, private val archive: BinanceArchive) : OiHistorySource {
     /** First day known to have an archive file, once an older stretch came back empty. */
@@ -64,68 +88,50 @@ class BinanceOiHistory(private val api: BinanceApi, private val archive: Binance
         val apiFloor = now - 30 * DAY + 2 * HOUR
         var coveredFrom = from
         if (to > apiFloor) {
-            val start = maxOf(from, apiFloor)
-            var end = to
-            var pages = 0
-            while (end >= start) {
-                if (pages++ == MAX_PAGES) {
-                    coveredFrom = end
-                    break
-                }
-                val pageStart = maxOf(start, end - 499 * res.ms)
-                out += api.openInterestHist(res.binance, pageStart, end, 500)
-                end = pageStart - 1
-            }
+            val (windows, reached) = windowsBackward(maxOf(from, apiFloor), to, 499 * res.ms, MAX_PAGES)
+            inParallel(windows, 4) { w -> api.openInterestHist(res.binance, w.first, w.last, 500) }.forEach { out += it }
+            if (reached > maxOf(from, apiFloor)) coveredFrom = reached
         }
         if (from < apiFloor && coveredFrom == from) {
             val first = archiveStart
             val dates = archiveDates(from, minOf(to, apiFloor), archiveStepDays).filter { first == null || !it.isBefore(first) }
-            out += archiveDays(dates.sortedDescending(), now, progress)
+            out += archiveDays(dates, now, progress)
         }
         return Fetched(out, coveredFrom)
     }
 
-    /** Downloads newest first in chunks and stops at a chunk with no files at all (before the archive starts). */
+    /** Downloads the day files [ARCHIVE_PARALLELISM] at a time (they are small; latency dominates). */
     private suspend fun archiveDays(dates: List<LocalDate>, now: Long, progress: (Int, Int) -> Unit): List<Sample> {
         if (dates.isEmpty()) return emptyList()
-        val out = ArrayList<Sample>()
         val done = AtomicInteger()
-        var failed = 0
-        var lastError: Exception? = null
         progress(0, dates.size)
-        for (chunk in dates.chunked(CHUNK)) {
-            val results = coroutineScope {
-                chunk.map { date ->
-                    async {
-                        try {
-                            Result.success(archive.day(date, now))
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            Result.failure(e)
-                        } finally {
-                            progress(done.incrementAndGet(), dates.size)
-                        }
-                    }
-                }.awaitAll()
-            }
-            for (r in results) {
-                r.onSuccess { out += it }.onFailure { failed++; lastError = it as? Exception }
-            }
-            if (results.all { it.getOrNull()?.isEmpty() == true } && chunk.size == CHUNK) {
-                archiveStart = chunk.first().plusDays(1)
-                progress(dates.size, dates.size)
-                break
+        val results = inParallel(dates, ARCHIVE_PARALLELISM) { date ->
+            try {
+                Result.success(archive.day(date, now))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            } finally {
+                progress(done.incrementAndGet(), dates.size)
             }
         }
+        // Days before the archive's first file come back empty (dates are oldest first); remember
+        // where it starts so scrolling back does not ask for them again.
+        val firstWithData = dates.indices.firstOrNull { results[it].getOrNull()?.isNotEmpty() == true }
+        val emptyLead = firstWithData ?: dates.size
+        if (emptyLead >= 8 && (0 until emptyLead).all { results[it].isSuccess }) {
+            archiveStart = if (firstWithData != null) dates[firstWithData] else dates.last().plusDays(1)
+        }
         // A few missing days are interpolated over; mostly failing means the archive is unreachable.
-        if (failed * 2 > dates.size) throw lastError ?: ApiException("Binance archive unavailable")
-        return out
+        val failures = results.mapNotNull { it.exceptionOrNull() }
+        if (failures.size * 2 > dates.size) throw failures.last()
+        return results.flatMap { it.getOrNull().orEmpty() }
     }
 
     companion object {
         private const val MAX_PAGES = 40
-        private const val CHUNK = 12
+        private const val ARCHIVE_PARALLELISM = 24
 
         /** Days whose archive file is needed: every day, Mondays for weekly steps (7), or the 1st of each month (0). */
         fun archiveDates(from: Long, to: Long, stepDays: Int): List<LocalDate> {
@@ -152,28 +158,18 @@ class BinanceOiHistory(private val api: BinanceApi, private val archive: Binance
 
 class BybitOiHistory(private val api: BybitApi) : OiHistorySource {
     override suspend fun history(from: Long, to: Long, res: OiResolution, archiveStepDays: Int, now: Long, progress: (Int, Int) -> Unit): Fetched<Sample> {
-        val out = ArrayList<Sample>()
-        var end = to
-        var emptyPages = 0
-        var pages = 0
-        while (end >= from) {
-            if (pages++ == MAX_PAGES) return Fetched(out, end)
-            val start = maxOf(from, end - 199 * res.ms)
-            val page = api.openInterest(res.bybit, start, end, 200)
-            out += page
-            if (page.isEmpty()) {
-                // Two empty windows in a row: we are before the start of Bybit's history.
-                if (++emptyPages >= 2) break
-            } else {
-                emptyPages = 0
-            }
-            end = start - 1
-        }
-        return Fetched(out, from)
+        val start = maxOf(from, LISTING)
+        if (to < start) return Fetched(emptyList(), from)
+        val (windows, reached) = windowsBackward(start, to, 199 * res.ms, MAX_PAGES)
+        val pages = inParallel(windows, 4) { w -> api.openInterest(res.bybit, w.first, w.last, 200) }
+        return Fetched(pages.flatten(), if (reached > start) reached else from)
     }
 
     private companion object {
         const val MAX_PAGES = 60
+
+        /** BTCUSDT linear perpetual listing on Bybit (2020-03-25); nothing older exists. */
+        const val LISTING = 1_585_094_400_000L
     }
 }
 
@@ -276,28 +272,20 @@ class OkxFundingHistory(private val api: OkxApi, private val pacer: Pacer) : Fun
 }
 
 /**
- * Hyperliquid funds hourly, so long ranges take many calls: pages of 500 hours are fetched newest
- * first and a load stops after [maxPages]; scrolling further back loads the next stretch.
+ * Hyperliquid funds hourly, so long ranges take many calls: windows of 500 hours are fetched in
+ * parallel, newest first, and a load stops after [maxPages]; scrolling further back loads more.
  */
 class HyperliquidFundingHistory(private val api: HyperliquidApi, private val maxPages: Int = 12) : FundingHistorySource {
+    override suspend fun history(from: Long, to: Long, now: Long): Fetched<FundingEvent> {
+        val start = maxOf(from, LAUNCH)
+        if (to < start) return Fetched(emptyList(), from)
+        val (windows, reached) = windowsBackward(start, to, 499 * HOUR, maxPages)
+        val pages = inParallel(windows, 4) { w -> api.fundingHistory(w.first, w.last) }
+        return Fetched(pages.flatten(), if (reached > start) reached else from)
+    }
+
     private companion object {
         /** 2023-01-01; Hyperliquid's mainnet perps started in 2023. */
         const val LAUNCH = 1_672_531_200_000L
-    }
-
-    override suspend fun history(from: Long, to: Long, now: Long): Fetched<FundingEvent> {
-        val out = ArrayList<FundingEvent>()
-        var end = to
-        var pages = 0
-        while (end >= from) {
-            if (pages++ == maxPages) return Fetched(out, end)
-            val start = maxOf(from, end - 499 * HOUR)
-            val page = api.fundingHistory(start, end)
-            out += page
-            // Nothing in this window: Hyperliquid did not list BTC that far back.
-            if (page.isEmpty() && (out.isNotEmpty() || end < LAUNCH)) break
-            end = start - 1
-        }
-        return Fetched(out, from)
     }
 }

@@ -6,6 +6,7 @@ import com.tryagain2019.androidplot.data.BybitFundingHistory
 import com.tryagain2019.androidplot.data.BybitOiHistory
 import com.tryagain2019.androidplot.data.FundingAggregator
 import com.tryagain2019.androidplot.data.FundingRepository
+import com.tryagain2019.androidplot.data.HistoryStore
 import com.tryagain2019.androidplot.data.HyperliquidFundingHistory
 import com.tryagain2019.androidplot.data.LiveOiRecorder
 import com.tryagain2019.androidplot.data.OiAggregator
@@ -13,7 +14,9 @@ import com.tryagain2019.androidplot.data.OiRepository
 import com.tryagain2019.androidplot.data.OkxFundingHistory
 import com.tryagain2019.androidplot.data.OkxOiHistory
 import com.tryagain2019.androidplot.data.Pacer
+import com.tryagain2019.androidplot.data.StoredSeries
 import com.tryagain2019.androidplot.model.Candle
+import com.tryagain2019.androidplot.model.DAY
 import com.tryagain2019.androidplot.model.Exchange
 import com.tryagain2019.androidplot.model.HOUR
 import com.tryagain2019.androidplot.model.LiveFunding
@@ -32,6 +35,8 @@ import com.tryagain2019.androidplot.net.HttpException
 import com.tryagain2019.androidplot.net.describeError
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
@@ -40,6 +45,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import java.io.File
@@ -47,6 +53,8 @@ import java.io.IOException
 import java.util.EnumMap
 import java.util.EnumSet
 import java.util.Locale
+import java.util.TreeMap
+import java.util.concurrent.Executors
 
 /** Endpoints used by the controller; tests point them at a local mock server. */
 class Apis(
@@ -90,20 +98,24 @@ class ChartController(
     /** Receives JavaScript statements for the WebView. */
     private val send: (String) -> Unit,
 ) {
-    private val okxPacer = Pacer(450)
+    // OKX rate limits per endpoint: 5 calls / 2 s for OI history, 10 / 2 s for funding history.
+    private val okxOiPacer = Pacer(420)
+    private val okxFundingPacer = Pacer(220)
+    private val store = HistoryStore(File(dataDir, "history"))
+    private val recorder = LiveOiRecorder(dataDir)
     private val oiRepo = OiRepository(
         mapOf(
             Exchange.BINANCE to BinanceOiHistory(apis.binance, apis.archive),
             Exchange.BYBIT to BybitOiHistory(apis.bybit),
-            Exchange.OKX to OkxOiHistory(apis.okx, okxPacer),
+            Exchange.OKX to OkxOiHistory(apis.okx, okxOiPacer),
         ),
-        LiveOiRecorder(dataDir),
+        recorder,
     )
     private val fundingRepo = FundingRepository(
         mapOf(
             Exchange.BINANCE to BinanceFundingHistory(apis.binance),
             Exchange.BYBIT to BybitFundingHistory(apis.bybit),
-            Exchange.OKX to OkxFundingHistory(apis.okx, okxPacer),
+            Exchange.OKX to OkxFundingHistory(apis.okx, okxFundingPacer),
             Exchange.HYPERLIQUID to HyperliquidFundingHistory(apis.hyperliquid),
         ),
     )
@@ -136,9 +148,23 @@ class ChartController(
     private var reloadWhenOnline = false
     private var lastAutoReload = 0L
 
-    /** Start of the range open interest / funding bars are built for; null until the first load finished. */
+    /** Start of the range open interest / funding bars are built for; null before the timeframe's load starts. */
     private var oiFrom: Long? = null
     private var fundingFrom: Long? = null
+
+    /** The recent part of the history is loaded (live updates and further loads may run). */
+    private var oiReady = false
+    private var fundingReady = false
+
+    /** History saved by earlier launches, read once in the background. */
+    private val restored = scope.async(start = CoroutineStart.LAZY) { restoreHistory() }
+    private var saveJob: Job? = null
+    private var historyChanged = false
+
+    /** Disk writes run here, not in [scope], so leaving the app cannot cancel a save half way. */
+    private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "history-writer").apply { isDaemon = true } }
+    private var prefetchJob: Job? = null
+    private val busyStates = LinkedHashMap<String, String?>()
     private val oiHistoryOk = EnumSet.noneOf(Exchange::class.java)
     private val oiHistoryFailedAt = EnumMap<Exchange, Long>(Exchange::class.java)
     private var lastOi: List<Candle> = emptyList()
@@ -166,11 +192,8 @@ class ChartController(
         pageReady = true
         lastStatusJson = ""
         sendInit()
-        when {
-            priceLoaded && loadJob?.isActive != true -> resendAll()
-            loadJob?.isActive == true -> Unit
-            else -> switchTo(tf)
-        }
+        // Loading normally started in onStart, while the page was still loading.
+        if (loadJob == null) switchTo(tf) else resendAll()
         queueStatus()
     }
 
@@ -180,9 +203,12 @@ class ChartController(
         val pausedFor = stoppedAt?.let { clock() - it }
         stoppedAt = null
         startPolling()
-        if (priceLoaded) {
-            feed.start(tf)
-            if (pausedFor != null && pausedFor > MINUTE) refreshAfterPause()
+        when {
+            loadJob == null -> switchTo(tf)
+            priceLoaded -> {
+                feed.start(tf)
+                if (pausedFor != null && pausedFor > MINUTE) refreshAfterPause()
+            }
         }
     }
 
@@ -193,11 +219,14 @@ class ChartController(
         feed.stop()
         pollJob?.cancel()
         pollJob = null
+        saveJob?.cancel()
+        saveNow()
     }
 
     fun destroy() {
         onStop()
         loadJob?.cancel()
+        prefetchJob?.cancel()
     }
 
     fun setTimeframe(code: String) {
@@ -237,11 +266,11 @@ class ChartController(
         val margin = maxOf(to - from, 20 * tf.nominalMs) / 2
         val wanted = maxOf(from - margin, EARLIEST)
         val oiStart = oiFrom
-        if (oiStart != null && wanted < oiStart - tf.nominalMs && olderOiJob?.isActive != true) {
+        if (oiReady && oiStart != null && wanted < oiStart - tf.nominalMs && olderOiJob?.isActive != true) {
             loadOlderOi(minOf(tf.barStart(wanted), tf.shift(tf.barStart(oiStart), -tf.historyBars / 2)))
         }
         val fundingStart = fundingFrom
-        if (fundingStart != null && wanted < fundingStart - tf.nominalMs && olderFundingJob?.isActive != true) {
+        if (fundingReady && fundingStart != null && wanted < fundingStart - tf.nominalMs && olderFundingJob?.isActive != true) {
             loadOlderFunding(minOf(tf.barStart(wanted), tf.shift(tf.barStart(fundingStart), -tf.historyBars / 2)))
         }
     }
@@ -249,6 +278,7 @@ class ChartController(
     // ------------------------------------------------------------------ loading
 
     private fun switchTo(next: Timeframe) {
+        if (priceLoaded) savePrice()
         tf = next
         gen++
         loadGen++
@@ -265,60 +295,198 @@ class ChartController(
         priceExhausted = false
         oiFrom = null
         fundingFrom = null
+        oiReady = false
+        fundingReady = false
         lastOi = emptyList()
         lastFunding.clear()
+        busyStates.clear()
         sendReset()
         loadJob = scope.launch { initialLoad(g) }
     }
 
+    /**
+     * Shows what earlier launches stored for this timeframe straight away, then downloads only what
+     * is missing: the newest candles, then the last four weeks of open interest and funding, then
+     * the rest of the history range.
+     */
     private suspend fun initialLoad(g: Int) {
+        val stored = withContext(Dispatchers.IO) { store.readCandles("price-${tf.code}") }.orEmpty()
+        if (g != loadGen) return
+        if (stored.isNotEmpty()) {
+            price.addAll(stored)
+            priceLoaded = true
+            sendPrice("set", price)
+            if (started) feed.start(tf)
+        }
+        coroutineScope {
+            val fresh = async { loadPrice(g, stored) }
+            restored.await()
+            if (g != loadGen) return@coroutineScope
+            val now = clock()
+            val from = tf.shift(tf.barStart(now), -(tf.historyBars - 1))
+            oiFrom = from
+            fundingFrom = from
+            publishOi(force = true)
+            publishFunding(force = true)
+            if (!fresh.await()) return@coroutineScope
+            val recentFrom = maxOf(from, tf.barStart(now - RECENT))
+            launch { loadOi(g, from, recentFrom, now) }
+            launch { loadFunding(g, from, recentFrom, now) }
+        }
+        if (g == loadGen) prefetchOtherTimeframes()
+    }
+
+    /**
+     * Once per session, after the first chart loaded: refresh the stored candles of the other
+     * timeframes so switching to them shows candles immediately.
+     */
+    private fun prefetchOtherTimeframes() {
+        if (prefetchJob != null) return
+        prefetchJob = scope.launch {
+            delay(1_500)
+            for (other in Timeframe.entries) {
+                if (other == tf) continue
+                val stored = withContext(Dispatchers.IO) { store.readCandles("price-${other.code}") }.orEmpty()
+                val last = stored.lastOrNull()
+                val missing = if (last == null) Int.MAX_VALUE else ((clock() - last.time) / other.nominalMs + 2).toInt()
+                val full = missing > PRICE_PAGE - 100
+                val bars = try {
+                    apis.binance.klines(other.binanceInterval, if (full) PRICE_PAGE else missing.coerceIn(2, PRICE_PAGE))
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    continue
+                }
+                if (bars.isEmpty() || other == tf) continue
+                val merged = if (full) bars else stored.filter { it.time < bars.first().time } + bars
+                withContext(Dispatchers.IO) { store.writeCandles("price-${other.code}", merged.takeLast(STORED_CANDLES)) }
+            }
+        }
+    }
+
+    /** Newest candles (all of them without stored ones). False if there is nothing to show at all. */
+    private suspend fun loadPrice(g: Int, stored: List<Candle>): Boolean {
+        val last = stored.lastOrNull()
+        val missing = if (last == null) Int.MAX_VALUE else ((clock() - last.time) / tf.nominalMs + 2).toInt()
+        val full = missing > PRICE_PAGE - 100
         busy("price", true)
         val bars = try {
-            apis.binance.klines(tf.binanceInterval, PRICE_PAGE)
+            apis.binance.klines(tf.binanceInterval, if (full) PRICE_PAGE else missing.coerceIn(2, PRICE_PAGE))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            if (g != loadGen) return
+            if (g != loadGen) return false
             busy("price", false)
-            reloadWhenOnline = e is IOException && e !is HttpException && e !is ApiException
             setSource("price", "Binance-Futures BTCUSDT", false, describeError(e))
+            if (stored.isNotEmpty()) return true // keep the stored candles; the stream/poller keeps trying
+            reloadWhenOnline = e is IOException && e !is HttpException && e !is ApiException
             message(json {
-                str("type", "error"); num("gen", g)
+                str("type", "error"); num("gen", gen)
                 str("text", "Couldn't load BTCUSDT candles from Binance: ${describeError(e)}")
             })
-            return
+            return false
         }
-        if (g != loadGen) return
+        if (g != loadGen) return false
         busy("price", false)
-        price.addAll(bars)
+        if (full) {
+            price.clear()
+            price.addAll(bars)
+            priceExhausted = bars.size < PRICE_PAGE
+        } else if (bars.isNotEmpty()) {
+            price.removeAll { it.time >= bars.first().time }
+            price.addAll(bars)
+        }
         priceLoaded = true
-        priceExhausted = bars.size < PRICE_PAGE
         setSource("price", "Binance-Futures BTCUSDT", true, "loaded")
         sendPrice("set", price)
-        if (started) feed.start(tf)
+        if (started && !feed.running) feed.start(tf)
+        return true
+    }
 
-        val now = clock()
-        val from = tf.shift(tf.barStart(now), -(tf.historyBars - 1))
-        coroutineScope {
-            launch {
-                busy("oi", true)
-                ensureOi(enabledOiExchanges(), from, now, g)
-                if (g == loadGen) {
-                    oiFrom = from
-                    busy("oi", false)
-                    publishOi(force = true)
-                }
-            }
-            launch {
-                busy("funding", true)
-                ensureFunding(Exchange.entries, from, now, g)
-                if (g == loadGen) {
-                    fundingFrom = from
-                    busy("funding", false)
-                    publishFunding(force = true)
-                }
-            }
+    private suspend fun loadOi(g: Int, from: Long, recentFrom: Long, now: Long) {
+        busy("oi", true)
+        ensureOi(enabledOiExchanges(), recentFrom, now, g)
+        if (g != loadGen) return
+        oiReady = true
+        publishOi(force = true)
+        if (recentFrom > from) {
+            ensureOi(enabledOiExchanges(), from, recentFrom, g)
+            if (g != loadGen) return
+            publishOi(force = true)
         }
+        busy("oi", false)
+        scheduleSave()
+    }
+
+    private suspend fun loadFunding(g: Int, from: Long, recentFrom: Long, now: Long) {
+        busy("funding", true)
+        ensureFunding(Exchange.entries, recentFrom, now, g)
+        if (g != loadGen) return
+        fundingReady = true
+        publishFunding(force = true)
+        if (recentFrom > from) {
+            ensureFunding(Exchange.entries, from, recentFrom, g)
+            if (g != loadGen) return
+            publishFunding(force = true)
+        }
+        busy("funding", false)
+        scheduleSave()
+    }
+
+    // ------------------------------------------------------------------ stored history
+
+    private suspend fun restoreHistory() {
+        class Loaded(val oi: Map<Exchange, StoredSeries?>, val funding: Map<Exchange, StoredSeries?>, val recorded: Map<Exchange, List<Sample>>)
+        val loaded = withContext(Dispatchers.IO) {
+            Loaded(
+                oi = Exchange.entries.filter { it.hasOiHistory }.associateWith { store.readSeries("oi-${it.key}") },
+                funding = Exchange.entries.associateWith { store.readSeries("funding-${it.key}") },
+                recorded = recorder.load(),
+            )
+        }
+        for ((ex, series) in loaded.oi) {
+            if (series == null) continue
+            oiRepo.restore(ex, series)
+            if (series.points.isNotEmpty()) oiHistoryOk += ex
+        }
+        for ((ex, series) in loaded.funding) if (series != null) fundingRepo.restore(ex, series)
+        for ((ex, list) in loaded.recorded) {
+            oiRepo.restore(ex, StoredSeries(TreeMap<Long, Double>().apply { for (p in list) put(p.time, p.value) }, emptyMap()))
+        }
+    }
+
+    private fun savePrice() {
+        val name = "price-${tf.code}"
+        val candles = ArrayList(price.takeLast(STORED_CANDLES))
+        writer.execute { store.writeCandles(name, candles) }
+    }
+
+    /** Saves once loading settles; history is copied here, on the UI thread, and written in the background. */
+    private fun scheduleSave() {
+        historyChanged = true
+        saveJob?.cancel()
+        saveJob = scope.launch {
+            delay(2_000)
+            saveNow()
+        }
+    }
+
+    private fun saveNow() {
+        if (priceLoaded) savePrice()
+        if (!historyChanged || !restored.isCompleted) return
+        historyChanged = false
+        val now = clock()
+        val oi = Exchange.entries.filter { it.hasOiHistory }.associateWith { oiRepo.snapshot(it, now) }
+        val funding = Exchange.entries.associateWith { fundingRepo.snapshot(it) }
+        writer.execute {
+            for ((ex, series) in oi) store.writeSeries("oi-${ex.key}", series)
+            for ((ex, series) in funding) store.writeSeries("funding-${ex.key}", series)
+        }
+    }
+
+    /** Waits for queued disk writes (tests). */
+    internal fun awaitSaved() {
+        writer.submit {}.get()
     }
 
     /** Loads open-interest history for [exchanges] in parallel; failures only mark that exchange's status. */
@@ -391,6 +559,7 @@ class ChartController(
                 if (g != loadGen) return@launch
                 oiFrom = minOf(currentFrom, newFrom)
                 publishOi(force = true)
+                scheduleSave()
             } finally {
                 if (g == loadGen) busy("oi", false)
             }
@@ -407,6 +576,7 @@ class ChartController(
                 if (g != loadGen) return@launch
                 fundingFrom = minOf(currentFrom, newFrom)
                 publishFunding(force = true)
+                scheduleSave()
             } finally {
                 if (g == loadGen) busy("funding", false)
             }
@@ -445,6 +615,7 @@ class ChartController(
                 ensureFunding(Exchange.entries, fundingStart, now, g)
                 if (g == loadGen) publishFunding(force = true)
             }
+            scheduleSave()
         }
     }
 
@@ -510,8 +681,8 @@ class ChartController(
             switchTo(tf)
         }
         oiRepo.recordLive(t, oi)
-        publishOi(force = false)
-        publishFunding(force = false)
+        if (oiReady) publishOi(force = false)
+        if (fundingReady) publishFunding(force = false)
         retryFailedHistory(t)
         refreshSettledFunding(t)
     }
@@ -546,6 +717,7 @@ class ChartController(
     /** Exchanges whose OI history failed (e.g. a network hiccup) are retried every minute. */
     private fun retryFailedHistory(now: Long) {
         val from = oiFrom ?: return
+        if (!oiReady) return
         val due = enabledOiExchanges().filter { it.hasOiHistory && it !in oiHistoryOk && now - (oiHistoryFailedAt[it] ?: 0L) > MINUTE }
         sideJobs.removeAll { !it.isActive }
         if (due.isEmpty() || sideJobs.isNotEmpty()) return
@@ -560,6 +732,7 @@ class ChartController(
     /** Once a funding settlement has passed, fetch the settled rate so past bars use the real value. */
     private fun refreshSettledFunding(now: Long) {
         val from = fundingFrom ?: return
+        if (!fundingReady) return
         sideJobs.removeAll { !it.isActive }
         for (ex in Exchange.entries) {
             val next = fundingRepo.live(ex)?.nextFundingTime ?: continue
@@ -590,6 +763,8 @@ class ChartController(
                 else -> OiAggregator.Input(samples, backfill = !ex.hasOiHistory)
             }
         }
+        // Only exchanges without public history (Hyperliquid) would not be an aggregate worth showing.
+        if (inputs.none { !it.backfill }) return
         val bars = OiAggregator.build(tf, tf.oiResolution.ms, from, clock(), inputs, oiRepo.liveTimes)
         val previous = lastOi
         lastOi = bars
@@ -618,6 +793,7 @@ class ChartController(
         lastFunding.putAll(series)
         val chosen = if (needSet) series else tails
         if (!needSet && tails.isEmpty()) return
+        if (series.values.all { it.isEmpty() }) return
         message(json {
             str("type", "funding"); num("gen", gen); str("mode", if (needSet) "set" else "live")
             key("series").obj { for ((ex, pts) in chosen) points(ex.key, pts, 6) }
@@ -675,9 +851,11 @@ class ChartController(
         lastFunding.clear()
         publishOi(force = true)
         publishFunding(force = true)
+        for ((what, detail) in busyStates.toList()) busy(what, true, detail)
     }
 
     private fun busy(what: String, busy: Boolean, detail: String? = null) {
+        if (busy) busyStates[what] = detail else busyStates.remove(what)
         message(json { str("type", "busy"); num("gen", gen); str("what", what); bool("busy", busy); str("detail", detail) })
     }
 
@@ -740,6 +918,10 @@ class ChartController(
 
     private companion object {
         const val PRICE_PAGE = 1000
+        const val STORED_CANDLES = 1500
+
+        /** Loaded first so the lower panes appear quickly; the rest of the range follows. */
+        const val RECENT = 28 * DAY
 
         /** BTCUSDT perpetual listing on Binance (Sep 2019); nothing older exists anywhere we look. */
         const val EARLIEST = 1_567_296_000_000L

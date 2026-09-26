@@ -1,7 +1,9 @@
 package com.tryagain2019.androidplot.data
 
+import com.tryagain2019.androidplot.model.DAY
 import com.tryagain2019.androidplot.model.Exchange
 import com.tryagain2019.androidplot.model.FundingEvent
+import com.tryagain2019.androidplot.model.HOUR
 import com.tryagain2019.androidplot.model.LiveFunding
 import com.tryagain2019.androidplot.model.MINUTE
 import com.tryagain2019.androidplot.model.Sample
@@ -13,9 +15,10 @@ import java.util.NavigableMap
 import java.util.NavigableSet
 import java.util.TreeMap
 import java.util.TreeSet
+import java.util.concurrent.Executors
 
 /** Contiguous time range already fetched for some series. */
-private data class Span(val from: Long, val to: Long) {
+data class Span(val from: Long, val to: Long) {
     fun missing(a: Long, b: Long): List<Pair<Long, Long>> = buildList {
         if (a < from) add(a to minOf(b, from))
         if (b > to) add(maxOf(a, to) to b)
@@ -41,11 +44,32 @@ class OiRepository(
     private val replaceableLive = EnumMap<Exchange, Long>(Exchange::class.java)
     private val rounds = TreeSet<Long>()
 
-    init {
-        recorder?.load()?.forEach { (ex, list) -> for (s in list) samples.getValue(ex)[s.time] = s.value }
+    fun samples(ex: Exchange): NavigableMap<Long, Double> = samples.getValue(ex)
+
+    /** Adds history saved by an earlier launch (see [snapshot]) or recorded live points. */
+    fun restore(ex: Exchange, stored: StoredSeries) {
+        samples.getValue(ex).putAll(stored.points)
+        for ((key, span) in stored.spans) {
+            if (key.startsWith("${ex.key}/")) spans[key] = spans[key]?.union(span.from, span.to) ?: span
+        }
     }
 
-    fun samples(ex: Exchange): NavigableMap<Long, Double> = samples.getValue(ex)
+    /**
+     * What to save for [ex]: fetched snapshots (they sit on whole minutes) plus the last two days of
+     * live points, thinned to hourly points beyond 90 days when the series gets large.
+     */
+    fun snapshot(ex: Exchange, now: Long): StoredSeries {
+        val points = TreeMap<Long, Double>()
+        for ((t, v) in samples.getValue(ex)) {
+            if (t % MINUTE != 0L && now - t > 2 * DAY) continue
+            points[t] = v
+        }
+        if (points.size > MAX_STORED) {
+            val old = points.headMap(now - 90 * DAY, false)
+            old.keys.removeAll { it % HOUR != 0L }
+        }
+        return StoredSeries(points, spans.filterKeys { it.startsWith("${ex.key}/") })
+    }
 
     /** Times of live polling rounds; bars use them as extra points so live bars get real highs and lows. */
     val liveTimes: NavigableSet<Long> get() = rounds
@@ -95,6 +119,10 @@ class OiRepository(
         rounds += time
         recorder?.record(time, values)
     }
+
+    private companion object {
+        const val MAX_STORED = 250_000
+    }
 }
 
 /**
@@ -120,6 +148,14 @@ class FundingRepository(private val sources: Map<Exchange, FundingHistorySource>
 
     fun fetchedTo(ex: Exchange): Long? = spans[ex]?.to
 
+    fun restore(ex: Exchange, stored: StoredSeries) {
+        events.getValue(ex).putAll(stored.points)
+        stored.spans[SPAN_KEY]?.let { span -> spans[ex] = spans[ex]?.union(span.from, span.to) ?: span }
+    }
+
+    fun snapshot(ex: Exchange): StoredSeries =
+        StoredSeries(TreeMap(events.getValue(ex)), spans[ex]?.let { mapOf(SPAN_KEY to it) } ?: emptyMap())
+
     suspend fun ensure(ex: Exchange, from: Long, to: Long, now: Long) {
         val source = sources[ex] ?: return
         val span = spans[ex]
@@ -137,6 +173,10 @@ class FundingRepository(private val sources: Map<Exchange, FundingHistorySource>
         val map = events.getValue(ex)
         for (e in list) map[Math.round(e.time.toDouble() / MINUTE) * MINUTE] = e.rate
     }
+
+    private companion object {
+        const val SPAN_KEY = "all"
+    }
 }
 
 /**
@@ -146,8 +186,12 @@ class FundingRepository(private val sources: Map<Exchange, FundingHistorySource>
 class LiveOiRecorder(private val dir: File, private val exchanges: Set<Exchange> = setOf(Exchange.HYPERLIQUID)) {
     private val lastWritten = EnumMap<Exchange, Long>(Exchange::class.java)
 
+    /** Appends happen off the caller's (UI) thread. */
+    private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "oi-recorder").apply { isDaemon = true } }
+
     private fun file(ex: Exchange) = File(dir, "oi-${ex.key}.csv")
 
+    /** Blocking: call from a background thread. */
     fun load(): Map<Exchange, List<Sample>> = exchanges.associateWith { ex ->
         val f = file(ex)
         if (!f.isFile) return@associateWith emptyList()
@@ -171,11 +215,18 @@ class LiveOiRecorder(private val dir: File, private val exchanges: Set<Exchange>
             val v = values[ex] ?: continue
             if (time - (lastWritten[ex] ?: 0L) < 5 * MINUTE) continue
             lastWritten[ex] = time
-            runCatching {
-                dir.mkdirs()
-                file(ex).appendText("$time,$v\n")
+            writer.execute {
+                runCatching {
+                    dir.mkdirs()
+                    file(ex).appendText("$time,$v\n")
+                }
             }
         }
+    }
+
+    /** Waits until queued appends are written (tests). */
+    fun awaitWrites() {
+        writer.submit {}.get()
     }
 
     private companion object {

@@ -41,6 +41,17 @@ How the panes are computed:
   A bar shows the time-weighted average of the rates that accrued during it. The bar in progress
   uses each exchange's current predicted rate.
 
+### Loading speed
+
+- Everything fetched is stored on the phone. A later launch draws the chart from storage at once and
+  then downloads only what is new (about 8 small requests).
+- Open interest and funding load the last four weeks first; older history follows in the background.
+  History pages are fetched in parallel.
+- After the first chart is up, the other timeframes' candles are refreshed in the background, so
+  switching timeframe shows candles immediately.
+- The first launch still downloads Binance's daily archive files for the 1D view once (about 170
+  small files); they are kept afterwards.
+
 ### Differences from Velo's numbers
 
 - Velo does not publish exactly which markets its aggregate includes. This app sums the four
@@ -80,7 +91,8 @@ first (you only lose the app's cached history and settings).
 - `./gradlew :app:test`: parser tests with each exchange's documented payloads, bar-building
   tests, and end-to-end runs of the whole data layer (loading, paging, archive, live polling,
   WebSocket stream, outages) against a local fake of all four exchanges
-  (`app/src/test/.../FakeExchanges.kt`).
+  (`app/src/test/.../FakeExchanges.kt`). `LoadTimingTest` prints how fast the panes appear with a
+  150 ms round trip per request, on a first launch and on a later one.
 - `tools/web-test/`: renders the chart page in headless Chromium with a fake Android bridge.
   `run.js` exercises touch pan, pinch zoom and long-press, and saves screenshots. `replay.js`
   replays a message transcript recorded by the end-to-end tests (`app/build/e2e/*.json`):

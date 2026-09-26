@@ -24,7 +24,7 @@ object Http {
         .callTimeout(45, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .dispatcher(Dispatcher().apply { maxRequests = 64; maxRequestsPerHost = 12 })
+        .dispatcher(Dispatcher().apply { maxRequests = 96; maxRequestsPerHost = 32 })
         .addInterceptor { chain ->
             chain.proceed(chain.request().newBuilder().header("User-Agent", "BTCPlot/1.0 (Android)").build())
         }

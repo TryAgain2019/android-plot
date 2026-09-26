@@ -30,8 +30,12 @@ import kotlin.math.sin
  * snapshots per period and 3 months of funding, newest-first ordering, ...). Values are smooth
  * functions of time so tests can check the aggregation.
  */
-class FakeExchanges(private val clock: () -> Long = System::currentTimeMillis) : Dispatcher() {
-    val requests: MutableList<String> = Collections.synchronizedList(ArrayList())
+class FakeExchanges(
+    private val clock: () -> Long = System::currentTimeMillis,
+    /** Added to every response, like a phone's round trip to the exchange. */
+    private val latencyMs: Long = 0,
+) : Dispatcher() {
+    val requests: MutableList<String> = java.util.concurrent.CopyOnWriteArrayList()
 
     /** Paths answered with this status code instead of data (to simulate outages or geo-blocks). */
     val failures: MutableMap<String, Int> = Collections.synchronizedMap(HashMap())
@@ -65,6 +69,12 @@ class FakeExchanges(private val clock: () -> Long = System::currentTimeMillis) :
     }
 
     override fun dispatch(request: RecordedRequest): MockResponse {
+        val response = respond(request)
+        if (latencyMs > 0 && !request.path.orEmpty().startsWith("/ws/")) response.setHeadersDelay(latencyMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return response
+    }
+
+    private fun respond(request: RecordedRequest): MockResponse {
         val url = request.requestUrl!!
         val path = url.encodedPath
         requests += path

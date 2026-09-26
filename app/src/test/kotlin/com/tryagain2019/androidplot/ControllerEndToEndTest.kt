@@ -107,6 +107,11 @@ class ControllerEndToEndTest {
         it.optString("type") == type && (mode == null || it.optString("mode") == mode) && (gen == null || it.optInt("gen") == gen)
     }
 
+    /** True once the timeframe's history has finished loading (the page's "loading" marks are cleared). */
+    private fun loaded(gen: Int, vararg what: String = arrayOf("price", "oi", "funding")) = what.all { w ->
+        messages.lastOrNull { it.optString("type") == "busy" && it.optString("what") == w && it.optInt("gen") == gen }?.optBoolean("busy") == false
+    }
+
     private fun expectedOi(tSec: Long) = (tSec * 1000).let { FakeExchanges.binanceOi(it) + FakeExchanges.bybitOi(it) + FakeExchanges.okxOi(it) + FakeExchanges.HL_OI }
 
     @Test
@@ -115,14 +120,15 @@ class ControllerEndToEndTest {
             controller.onStart()
             controller.onPageReady()
         }
-        waitFor("oi + funding") { find("oi", "set").isNotEmpty() && find("funding", "set").isNotEmpty() }
+        waitFor("reset") { find("reset").isNotEmpty() }
         assertEquals("init", messages.first().getString("type"))
         val reset = find("reset").first()
         assertEquals("1d", reset.getString("tf"))
         val gen = reset.getInt("gen")
+        waitFor("history loaded") { loaded(gen) }
 
         // Price: 1000 daily candles ending with today's.
-        val price = find("price", "set", gen).single().getJSONArray("bars")
+        val price = find("price", "set", gen).last().getJSONArray("bars")
         assertEquals(1000, price.length())
         val today = Timeframe.D1.barStart(System.currentTimeMillis()) / 1000
         assertEquals(today, price.getJSONArray(price.length() - 1).getLong(0))
@@ -142,7 +148,8 @@ class ControllerEndToEndTest {
             assertTrue(b.getDouble(2) >= maxOf(b.getDouble(1), b.getDouble(4)) - 1e-6 && b.getDouble(3) <= minOf(b.getDouble(1), b.getDouble(4)) + 1e-6)
             assertEquals(b.getDouble(4), oiSet.getJSONArray(i + 1).getDouble(1), 0.01) // close == next open
         }
-        assertTrue(fake.archiveRequests.get() in 200..240, "archive requests: ${fake.archiveRequests.get()}")
+        // One archive file per day older than the API's 30 days, and nothing twice.
+        assertTrue(fake.archiveRequests.get() in Timeframe.D1.historyBars - 32..Timeframe.D1.historyBars - 27, "archive requests: ${fake.archiveRequests.get()}")
 
         // Funding: % per 8h; Hyperliquid's hourly rate x8; OKX only ~3 months back.
         val funding = find("funding", "set", gen).last().getJSONObject("series")
@@ -177,7 +184,7 @@ class ControllerEndToEndTest {
         onUi { controller.setTimeframe("1h") }
         waitFor("hourly reset") { find("reset").any { it.getString("tf") == "1h" } }
         val gen = find("reset").last().getInt("gen")
-        waitFor("hourly oi + funding") { find("oi", "set", gen).isNotEmpty() && find("funding", "set", gen).isNotEmpty() }
+        waitFor("hourly history") { loaded(gen) }
         assertEquals("1h", settings["tf"])
         val oi = find("oi", "set", gen).last().getJSONArray("bars")
         assertEquals(Timeframe.H1.historyBars, oi.length())
@@ -185,7 +192,7 @@ class ControllerEndToEndTest {
         assertEquals(expectedOi(bar.getLong(0)), bar.getDouble(1), 0.5)
 
         // Near the left edge: older candles are prepended.
-        val price = find("price", "set", gen).single().getJSONArray("bars")
+        val price = find("price", "set", gen).last().getJSONArray("bars")
         val firstSec = price.getJSONArray(0).getLong(0)
         onUi { controller.onVisibleRange(gen, firstSec.toDouble(), firstSec + 100 * 3600.0, 5.0) }
         waitFor("prepend") { find("price", "prepend", gen).isNotEmpty() }
@@ -219,7 +226,7 @@ class ControllerEndToEndTest {
     @Test
     fun weeklyAndMonthlyUseSparseArchiveDays() {
         val gen = openOn("1w")
-        waitFor("weekly oi") { find("oi", "set", gen).isNotEmpty() }
+        waitFor("weekly history") { loaded(gen) }
         val weekly = find("oi", "set", gen).last().getJSONArray("bars")
         assertEquals(Timeframe.W1.historyBars, weekly.length())
         val w = weekly.getJSONArray(20)
@@ -228,7 +235,7 @@ class ControllerEndToEndTest {
         assertTrue(weeklyArchive in 100..125, "weekly archive requests $weeklyArchive")
 
         onUi { controller.setTimeframe("1M") }
-        waitFor("monthly oi") { find("oi", "set").lastOrNull()?.optInt("gen") == find("reset").last().getInt("gen") }
+        waitFor("monthly history") { find("reset").last().getString("tf") == "1M" && loaded(find("reset").last().getInt("gen")) }
         val monthly = find("oi", "set").last().getJSONArray("bars")
         // OKX keeps ~1440 daily snapshots (~3.9 years), which limits how far back the aggregate goes.
         assertTrue(monthly.length() in 44..48, "monthly bars ${monthly.length()}")
@@ -300,7 +307,6 @@ class ControllerEndToEndTest {
             controller.setSetting("tz", "utc")
         }
         val gen = find("reset").last().getInt("gen")
-        assertEquals(2, gen)
         waitFor("oi + funding for the new generation") { find("oi", "set", gen).isNotEmpty() && find("funding", "set", gen).isNotEmpty() }
         assertEquals("utc", settings["tz"])
     }
@@ -308,7 +314,7 @@ class ControllerEndToEndTest {
     @Test
     fun hourlyFundingIsAveragedPerBar() {
         val gen = openOn("4h")
-        waitFor("funding") { find("funding", "set", gen).isNotEmpty() }
+        waitFor("4h history") { loaded(gen) }
         val series = find("funding", "set", gen).last().getJSONObject("series")
         val hl = series.getJSONArray("hyperliquid")
         assertTrue(hl.length() >= Timeframe.H4.historyBars - 1)

@@ -55,7 +55,7 @@ enum class Timeframe(
     M30("30m", "30m", "30m", 30 * MINUTE, OiResolution.M15, OiResolution.M30, 300, 1, 120),
     H1("1h", "1h", "1h", HOUR, OiResolution.M15, OiResolution.H1, 300, 1, 120),
     H4("4h", "4h", "4h", 4 * HOUR, OiResolution.H1, OiResolution.H4, 300, 1, 120),
-    D1("1d", "1D", "1d", DAY, OiResolution.H4, OiResolution.D1, 250, 1, 180),
+    D1("1d", "1D", "1d", DAY, OiResolution.H4, OiResolution.D1, 200, 1, 180),
     W1("1w", "1W", "1w", WEEK, OiResolution.D1, OiResolution.D1, 110, 7, 104),
     MN1("1M", "1M", "1M", 30 * DAY, OiResolution.D1, OiResolution.D1, 48, 0, 48),
     ;
