@@ -2,15 +2,23 @@ package com.tryagain2019.androidplot.model
 
 import kotlin.math.floor
 
-/** The Binance order book the heatmap records. */
+/** An order book the heatmap can record; the heatmap sums the ones switched on. */
 enum class BookMarket(val key: String, val displayName: String, val levels: Int) {
     /** The book Material Indicators' FireCharts shows (and the one people mean by "Binance sell walls"). */
     SPOT("spot", "Binance spot BTCUSDT", 5000),
     FUTURES("futures", "Binance-Futures BTCUSDT", 1000),
+    BYBIT("bybit", "Bybit BTCUSDT", 500),
+    OKX("okx", "OKX BTC-USDT-SWAP", 5000),
+
+    /** Hyperliquid serves 20 levels a side, so the book is fetched grouped by $10 and by $100. */
+    HYPERLIQUID("hyperliquid", "Hyperliquid BTC", 20),
     ;
 
     companion object {
         fun of(key: String?): BookMarket? = entries.firstOrNull { it.key == key }
+
+        /** The books switched on (setting `book.<key>`, on unless "false"). */
+        fun enabled(setting: (String) -> String?): List<BookMarket> = entries.filter { setting("book.${it.key}") != "false" }
     }
 }
 
@@ -39,6 +47,18 @@ class BookSnapshot(
         const val MAX_DISTANCE = 0.10
 
         fun bin(price: Double): Int = floor(price / BIN).toInt()
+
+        /** The sum of several books (every exchange's at one moment); the mid is the average of theirs. */
+        fun combine(time: Long, parts: Collection<BookSnapshot>): BookSnapshot? {
+            if (parts.isEmpty()) return null
+            val bidTop = parts.maxOf { it.bidTop }
+            val bids = FloatArray(bidTop - parts.minOf { it.bidTop - it.bids.size + 1 } + 1)
+            for (p in parts) for (j in p.bids.indices) bids[bidTop - p.bidTop + j] += p.bids[j]
+            val askBottom = parts.minOf { it.askBottom }
+            val asks = FloatArray(parts.maxOf { it.askBottom + it.asks.size - 1 } - askBottom + 1)
+            for (p in parts) for (j in p.asks.indices) asks[p.askBottom - askBottom + j] += p.asks[j]
+            return BookSnapshot(time, parts.sumOf { it.mid } / parts.size, bidTop, bids, askBottom, asks)
+        }
 
         /**
          * Bins raw levels as the exchange sends them ([prices] and [quantities] side by side, best

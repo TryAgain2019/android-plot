@@ -23,7 +23,7 @@ import kotlin.math.pow
  */
 class BookStore internal constructor(private val dir: File) {
     private val checked = HashSet<String>()
-    private var prunedDay = -1L
+    private val prunedDay = HashMap<BookMarket, Long>()
     private val first = HashMap<BookMarket, Long?>()
     private val last = HashMap<BookMarket, Long>()
 
@@ -45,8 +45,8 @@ class BookStore internal constructor(private val dir: File) {
             if (first[market] == null) first.remove(market)
             last[market] = maxOf(last[market] ?: 0L, s.time)
         }
-        if (day != prunedDay) {
-            prunedDay = day
+        if (prunedDay[market] != day) {
+            prunedDay[market] = day
             prune(market, day)
         }
     }
@@ -66,6 +66,8 @@ class BookStore internal constructor(private val dir: File) {
             }
         }
     }
+
+    fun readList(market: BookMarket, from: Long, to: Long): List<BookSnapshot> = ArrayList<BookSnapshot>().also { list -> read(market, from, to) { list += it } }
 
     /** Time of the oldest recorded snapshot, or null before the first one. */
     @Synchronized
@@ -166,7 +168,8 @@ class BookStore internal constructor(private val dir: File) {
 
     companion object {
         const val RETENTION_DAYS = 31
-        const val MAX_BYTES = 96L * 1024 * 1024
+        /** Per book; a month of snapshots is normally a few MB. */
+        const val MAX_BYTES = 64L * 1024 * 1024
         private const val FILE_MAGIC = 0x424f4f4b // "BOOK"
         private const val VERSION = 1
         private const val HEADER_BYTES = 16

@@ -4,8 +4,9 @@ An Android app (built for a Galaxy S21, runs on Android 8+) that draws the three
 the reference screenshot and keeps it updating live:
 
 1. **BTCUSDT, Binance-Futures** candles, drawn over an **order book heatmap** in the style of
-   Material Indicators' FireCharts (sell orders in fire colours, buy orders in teal), with volume
-   bars and the visible high/low labelled
+   Material Indicators' FireCharts (sell orders in fire colours, buy orders in teal): the order
+   books of Binance, Bybit, OKX and Hyperliquid added together, with volume bars and the visible
+   high/low labelled
 2. **Aggregated Open Interest**: BTC perpetual OI, summed over Binance, Bybit, OKX and Hyperliquid
 3. **Cross Exchange Funding**: funding rate per exchange in % per 8 h, as step lines
 
@@ -77,18 +78,33 @@ heatmap, Bookmap, TensorCharts, TapeSurf).
 
 ### How the app builds it
 
-The app records Binance's book itself:
+The app records the order books itself, from every exchange it uses, and adds them together:
 
-- **While the app is open**: a depth snapshot every minute: spot `GET /api/v3/depth?limit=5000`
-  (5000 price levels a side, about 60 KB, weight 250), or futures `GET /fapi/v1/depth?limit=1000`
-  if you pick the futures book in ⓘ.
-- **While it is closed**: a JobScheduler job takes a snapshot about every 15 minutes (Android may
-  delay it when the phone sleeps deeply). ⓘ → *Record while closed* sets it to always, Wi-Fi only or
-  off. With the spot book that is about 6 MB a day.
-- Snapshots are summed into $10 price bins (up to 10 % from the price) and kept on the phone for
-  31 days, at about 2 bytes per bin.
+| Book | Request | Levels a side | Snapshot |
+|---|---|---|---|
+| Binance spot BTCUSDT | `GET /api/v3/depth?limit=5000` (weight 250) | 5000 | ~60 KB |
+| Binance futures BTCUSDT | `GET /fapi/v1/depth?limit=1000` (weight 20) | 1000 | ~8 KB |
+| Bybit BTCUSDT (linear) | `GET /v5/market/orderbook?category=linear&limit=500` | 500 | ~4 KB |
+| OKX BTC-USDT-SWAP | `GET /api/v5/market/books-full?sz=5000` (sizes in 0.01 BTC contracts) | 5000 | ~49 KB |
+| Hyperliquid BTC | `POST /info {"type":"l2Book","nSigFigs":4}` and `nSigFigs: 3` | 20 of $10, 20 of $100 | ~1 KB |
+
+Each can be switched off in ⓘ. Hyperliquid only returns 20 levels a side, so it is asked twice:
+grouped by $10 near the price and by $100 further out. The part of a $100 level that the $10 levels
+do not hold is spread evenly over its $10 bins.
+
+- **While the app is open**: all enabled books at once, every minute (about 7 MB an hour with all
+  five on).
+- **While it is closed**: a JobScheduler job does the same about every 15 minutes (Android may
+  delay it when the phone sleeps deeply), about 11 MB a day with all five. ⓘ → *Record while
+  closed* sets it to always, Wi-Fi only or off.
+- Every snapshot is summed into $10 price bins (up to 10 % from the price) and kept on the phone
+  for 31 days, at about 2 bytes per bin, **per exchange**. Switching an exchange off therefore also
+  takes it out of the history already recorded, and switching it back on brings it back.
+- The heatmap adds up the exchanges' books of each sampling round (the requests go out together, so
+  a round's snapshots are seconds apart). If an exchange misses a round, its last book counts for up
+  to 30 minutes.
 - Each bar shows the **average quantity** resting in each price band while the bar was open. A
-  snapshot counts until the next one, but for at most 30 minutes, so gaps in the recording stay
+  round counts until the next one, but for at most 30 minutes, so gaps in the recording stay
   black. Bands are $10 (1m, 5m), $20 (15m–1h), $50 (4h), $100 (1D), $250 (1W) and $500 (1M).
 - **Sensitivity**: the slider's left handle hides quantities below it, the right handle is where
   colours reach full strength. The range adapts to the timeframe's data (5th to 99.8th
@@ -96,8 +112,9 @@ The app records Binance's book itself:
 
 The heat builds up from the moment the app starts recording: older bars stay black. FireCharts
 shows years because Material Indicators have been recording since. A REST snapshot also only
-holds the 5000 price levels nearest the price. ⓘ shows the price range the latest snapshot
-covered, and walls further away than that are not seen.
+holds the price levels nearest the price (Binance spot's 5000 reach about ±1 %; Hyperliquid's $100
+levels about ±2 %). ⓘ shows the range each exchange's latest snapshot covered; walls further away
+are not seen.
 
 ### Differences from Velo's numbers
 

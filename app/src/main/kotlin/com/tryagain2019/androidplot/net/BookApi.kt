@@ -43,6 +43,7 @@ class BookApi(
             result ?: throw last!!
         }
         BookMarket.FUTURES -> client.get("$futuresBase/fapi/v1/depth?symbol=$symbol&limit=${market.levels}") { BookParsers.depth(it, time()) }
+        else -> throw IllegalArgumentException("not a Binance book: $market")
     }
 }
 
@@ -51,26 +52,47 @@ object BookParsers {
     fun depth(json: String, time: Long): BookSnapshot {
         val o = JSONObject(json)
         if (!o.has("bids") || !o.has("asks")) throw ApiException(errorDetail(json).ifEmpty { "no order book in response" })
-        val (bidPrices, bidQuantities) = levels(o.getJSONArray("bids"))
-        val (askPrices, askQuantities) = levels(o.getJSONArray("asks"))
+        val (bidPrices, bidQuantities) = bookLevels(o.getJSONArray("bids"))
+        val (askPrices, askQuantities) = bookLevels(o.getJSONArray("asks"))
         return BookSnapshot.fromLevels(time, bidPrices, bidQuantities, askPrices, askQuantities)
             ?: throw ApiException("empty order book")
     }
+}
 
-    private fun levels(arr: JSONArray): Pair<DoubleArray, DoubleArray> {
-        val prices = DoubleArray(arr.length())
-        val quantities = DoubleArray(arr.length())
-        var n = 0
-        for (i in 0 until arr.length()) {
-            val level = arr.optJSONArray(i) ?: continue
-            val p = level.num(0)
-            val q = level.num(1)
-            if (p.isFinite() && q.isFinite()) {
-                prices[n] = p
-                quantities[n] = q
-                n++
-            }
+/** Price levels sent as `[[price, quantity, ...], ...]`; quantities are multiplied by [scale] (e.g. contracts to BTC). */
+internal fun bookLevels(arr: JSONArray?, scale: Double = 1.0): Pair<DoubleArray, DoubleArray> {
+    val count = arr?.length() ?: 0
+    val prices = DoubleArray(count)
+    val quantities = DoubleArray(count)
+    var n = 0
+    for (i in 0 until count) {
+        val level = arr!!.optJSONArray(i) ?: continue
+        val p = level.num(0)
+        val q = level.num(1) * scale
+        if (p.isFinite() && q.isFinite()) {
+            prices[n] = p
+            quantities[n] = q
+            n++
         }
-        return prices.copyOf(n) to quantities.copyOf(n)
+    }
+    return prices.copyOf(n) to quantities.copyOf(n)
+}
+
+/** Current order books of every exchange the heatmap can include. */
+class OrderBooks(
+    private val binance: BookApi,
+    private val bybit: BybitApi,
+    private val okx: OkxApi,
+    private val hyperliquid: HyperliquidApi,
+) {
+    suspend fun snapshot(market: BookMarket, time: () -> Long): BookSnapshot = when (market) {
+        BookMarket.SPOT, BookMarket.FUTURES -> binance.snapshot(market, time)
+        BookMarket.BYBIT -> bybit.orderBook(market.levels, time)
+        BookMarket.OKX -> okx.orderBook(market.levels, time)
+        BookMarket.HYPERLIQUID -> hyperliquid.orderBook(time)
+    }
+
+    companion object {
+        fun production(client: OkHttpClient) = OrderBooks(BookApi(client), BybitApi(client), OkxApi(client), HyperliquidApi(client))
     }
 }

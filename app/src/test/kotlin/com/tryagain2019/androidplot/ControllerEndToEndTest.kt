@@ -80,6 +80,8 @@ class ControllerEndToEndTest {
             socketBases = listOf(base.replaceFirst("http", "ws") + "/ws/"),
         )
         settings["tf"] = "1d"
+        // The order book heatmap has its own tests; elsewhere its sampling would only compete for CPU.
+        settings["heat"] = "off"
         dataDir = tmp.newFolder("data")
         controller = ChartController(scope, apis, MapSettings(settings), dataDir, "test", pollIntervalMs = 400, bookIntervalMs = 300) { js ->
             val prefix = "window.chartApp&&chartApp.receive("
@@ -183,15 +185,23 @@ class ControllerEndToEndTest {
         }
     }
 
+    private fun onlyBooks(vararg keys: String) {
+        for (m in BookMarket.entries) settings["book.${m.key}"] = (m.key in keys).toString()
+    }
+
+    private fun bookRequests() = fake.requests.count { it.endsWith("/depth") || it == "/v5/market/orderbook" || it == "/api/v5/market/books-full" }
+
     @Test
     fun orderBookHeatmapIsRecordedAndStreamed() {
+        settings.remove("heat")
+        onlyBooks("spot")
         onUi {
             controller.onStart()
             controller.onPageReady()
         }
         waitFor("heatmap") { find("heat", "set").isNotEmpty() }
         val set = find("heat", "set").first()
-        assertEquals("spot", set.getString("market"))
+        assertEquals("[\"spot\"]", set.getJSONArray("books").toString())
         assertEquals(100.0, set.getDouble("binSize"))
         waitFor("live heat") { find("heat", "live").size >= 3 }
         assertTrue(fake.requests.contains("/api/v3/depth"))
@@ -208,33 +218,80 @@ class ControllerEndToEndTest {
         assertTrue(walls.isNotEmpty())
         assertTrue(walls.minOf { it.second } > inner.filter { (bin, _) -> bin % 5 != 0 }.maxOf { it.second }, "walls stand out")
         assertEquals(HeatBuilder.code(50.0), inner.first { (bin, _) -> bin % 5 != 0 }.second, "a \$100 bin holds 200 levels of 0.25 BTC")
-        waitFor("book status") { find("status").lastOrNull()?.getJSONObject("sources")?.optJSONObject("book")?.optString("state") == "ok" }
+        waitFor("book status") { find("status").lastOrNull()?.getJSONObject("sources")?.optJSONObject("book.spot")?.optString("state") == "ok" }
 
         // What was recorded is on disk: a new chart (e.g. after a restart) shows it straight away.
         onUi { controller.onStop() }
         controller.awaitSaved()
-        val stored = HeatBuilder.load(BookStore.forDir(File(dataDir, "book")), BookMarket.SPOT, Timeframe.M1, System.currentTimeMillis())
+        val stored = HeatBuilder.load(BookStore.forDir(File(dataDir, "book")), listOf(BookMarket.SPOT), Timeframe.M1, System.currentTimeMillis())
         assertTrue(decodeHeat(stored.encodeAll(System.currentTimeMillis())).isNotEmpty())
 
         // Switching to the futures book records that one instead.
         onUi {
             controller.onStart()
-            controller.setSetting("heat.book", "futures")
+            controller.setSetting("book.spot", "false")
+            controller.setSetting("book.futures", "true")
         }
-        waitFor("futures heatmap") { find("heat", "set").any { it.optString("market") == "futures" } }
+        waitFor("futures heatmap") { find("heat", "set").any { it.getJSONArray("books").toString() == "[\"futures\"]" } }
         waitFor("futures depth") { fake.requests.contains("/fapi/v1/depth") }
 
         // Switched off: the page is told, and sampling stops.
         onUi { controller.setSetting("heat", "off") }
         waitFor("heat off") { find("heat", "off").isNotEmpty() }
         Thread.sleep(400)
-        val requests = fake.requests.count { it.endsWith("/depth") }
+        val requests = bookRequests()
         Thread.sleep(1_000)
-        assertEquals(requests, fake.requests.count { it.endsWith("/depth") })
+        assertEquals(requests, bookRequests())
+    }
+
+    @Test
+    fun heatmapSumsTheOrderBooksOfAllExchanges() {
+        settings.remove("heat")
+        onUi {
+            controller.onStart()
+            controller.onPageReady()
+        }
+        waitFor("heatmap") { find("heat", "set").isNotEmpty() }
+        assertEquals("""["spot","futures","bybit","okx","hyperliquid"]""", find("heat", "set").first().getJSONArray("books").toString())
+        waitFor("live heat") { find("heat", "live").size >= 3 }
+        for (path in listOf("/api/v3/depth", "/fapi/v1/depth", "/v5/market/orderbook", "/api/v5/market/books-full", "/info")) {
+            assertTrue(fake.requests.contains(path), path)
+        }
+        waitFor("book status") {
+            val sources = find("status").lastOrNull()?.getJSONObject("sources")
+            sources != null && BookMarket.entries.all { sources.optJSONObject("book.${it.key}")?.optString("state") == "ok" }
+        }
+
+        // $1000-$1200 below the price only Binance spot (5000 levels 50 cents apart) and
+        // Hyperliquid's $100 levels reach: 50 + 25 BTC per $100 bin, plus the walls.
+        val today = Timeframe.D1.barStart(System.currentTimeMillis())
+        val bar = decodeHeat(Base64.getDecoder().decode(find("heat", "live").last().getString("data"))).single { it.time == today }
+        val mid = FakeExchanges.price(System.currentTimeMillis())
+        val far = ((mid - 1200) / 100).toInt() + 1 until ((mid - 1000) / 100).toInt()
+        for (bin in far) {
+            val code = bar.bids[bar.bidTop - bin]
+            when {
+                bin % 10 == 0 -> assertEquals(HeatBuilder.code(49.75 + 60 + 24.75 + 60), code, "wall at ${bin * 100}")
+                bin % 5 == 0 -> assertEquals(HeatBuilder.code(49.75 + 25 + 24.75 + 25), code, "wall at ${bin * 100}")
+                else -> assertEquals(HeatBuilder.code(50.0 + 25.0), code, "bin ${bin * 100}")
+            }
+        }
+        // Near the price every exchange adds up: far more than Binance spot's 50 BTC.
+        assertTrue(HeatBuilder.quantity(bar.bids[3]) > 300, "near the price: ${HeatBuilder.quantity(bar.bids[3])} BTC")
+
+        // Each exchange is stored on its own, so switching one off also takes it out of the history.
+        onUi { controller.setSetting("book.okx", "false") }
+        waitFor("heatmap without OKX") { find("heat", "set").any { it.getJSONArray("books").length() == 4 } }
+        Thread.sleep(400)
+        val okxCalls = fake.requests.count { it == "/api/v5/market/books-full" }
+        Thread.sleep(1_000)
+        assertEquals(okxCalls, fake.requests.count { it == "/api/v5/market/books-full" })
+        for (m in BookMarket.entries) assertTrue(File(dataDir, "book/${m.key}").isDirectory, m.key)
     }
 
     @Test
     fun recordedOrderBookShowsAsHeatOnTheHourlyChart() {
+        settings.remove("heat")
         // Three days recorded in the background (a snapshot every 15 minutes), before the app opens.
         val now = System.currentTimeMillis()
         val store = BookStore.forDir(File(dataDir, "book"))
@@ -383,7 +440,8 @@ class ControllerEndToEndTest {
         }
         waitFor("error") { find("error").isNotEmpty() }
         fake.failures.clear()
-        waitFor("automatic reload", timeoutMs = 30_000) { find("price", "set").isNotEmpty() }
+        // A reload tried just before the network came back holds the next one off for 30 s.
+        waitFor("automatic reload", timeoutMs = 45_000) { find("price", "set").isNotEmpty() }
     }
 
     @Test

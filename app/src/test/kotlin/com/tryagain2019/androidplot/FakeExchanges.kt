@@ -145,6 +145,8 @@ class FakeExchanges(
                 )
                 path == "/api/v5/public/funding-rate-history" -> json(okxFunding(ql("after"), q("limit")!!.toInt(), now))
                 path == "/info" -> hyperliquid(request.body.clone().readUtf8(), now)
+                path == "/v5/market/orderbook" -> json(bybitBook(q("category")!!, q("limit")!!.toInt(), now))
+                path == "/api/v5/market/books-full" -> json(okxBook(q("instId")!!, q("sz")!!.toInt(), now))
                 path == "/api/v3/depth" -> json(depthJson(now, q("limit")!!.toInt().also { require(it <= 5000) }, 0.5, futures = false))
                 path == "/fapi/v1/depth" -> json(depthJson(now, q("limit")!!.toInt().also { require(it <= 1000) }, 0.2, futures = true))
                 path.startsWith("/ws/") -> stream(path.removePrefix("/ws/"))
@@ -280,6 +282,7 @@ class FakeExchanges(
                 """[{"universe":[{"name":"ETH","szDecimals":4,"maxLeverage":25},{"name":"BTC","szDecimals":5,"maxLeverage":40}]},
                 [{"funding":"0.00001","openInterest":"1000","markPx":"2500"},{"funding":"$HL_FUNDING","openInterest":"${fmt(HL_OI)}","markPx":"${fmt(price(now))}"}]]""",
             )
+            "l2Book" -> json(hyperliquidBook(if (req.isNull("nSigFigs")) 5 else req.getInt("nSigFigs"), now))
             "fundingHistory" -> {
                 val start = req.getLong("startTime")
                 val end = if (req.has("endTime")) req.getLong("endTime") else now
@@ -289,6 +292,55 @@ class FakeExchanges(
             }
             else -> MockResponse().setResponseCode(422).setBody("Failed to deserialize the JSON body")
         }
+    }
+
+    /** Levels every [step] dollars from the best bid down and the best ask up, as `(price, BTC)`. */
+    private fun ladder(now: Long, limit: Int, step: Double): Pair<List<Pair<Double, Double>>, List<Pair<Double, Double>>> {
+        val bestBid = Math.floor(price(now) / step) * step
+        val bids = (0 until limit).map { i -> (bestBid - i * step).let { it to bookQuantity(it) } }
+        val asks = (0 until limit).map { i -> (bestBid + (i + 1) * step).let { it to bookQuantity(it) } }
+        return bids to asks
+    }
+
+    private fun bybitBook(category: String, limit: Int, now: Long): String {
+        require(category == "linear" && limit <= 500)
+        val (bids, asks) = ladder(now, limit, 0.1)
+        fun side(levels: List<Pair<Double, Double>>) = levels.joinToString(",", "[", "]") { (p, q) -> "[\"${fmt(p)}\",\"${fmt(q)}\"]" }
+        return """{"retCode":0,"retMsg":"OK","result":{"s":"BTCUSDT","b":${side(bids)},"a":${side(asks)},"ts":$now,"u":1,"seq":1,"cts":$now},"retExtInfo":{},"time":$now}"""
+    }
+
+    /** OKX sizes are contracts of 0.01 BTC. */
+    private fun okxBook(instId: String, size: Int, now: Long): String {
+        require(instId == "BTC-USDT-SWAP" && size <= 5000)
+        val (bids, asks) = ladder(now, size, 0.1)
+        fun side(levels: List<Pair<Double, Double>>) = levels.joinToString(",", "[", "]") { (p, q) -> "[\"${fmt(p)}\",\"${fmt(q * 100)}\",\"3\"]" }
+        return """{"code":"0","msg":"","data":[{"asks":${side(asks)},"bids":${side(bids)},"ts":"$now"}]}"""
+    }
+
+    /**
+     * Hyperliquid's l2Book: the book on a $1 grid grouped to [sigFigs] significant figures (bids
+     * rounded down, asks up), 20 levels a side.
+     */
+    private fun hyperliquidBook(sigFigs: Int, now: Long): String {
+        val mid = price(now)
+        val step = Math.pow(10.0, Math.floor(Math.log10(mid)) - (sigFigs - 1))
+        val bestBid = Math.floor(mid)
+        val bestAsk = bestBid + 1
+        fun sum(from: Double, to: Double): Double { // grid prices in [from, to]
+            var total = 0.0
+            var p = Math.ceil(from)
+            while (p <= to) {
+                total += bookQuantity(p)
+                p += 1
+            }
+            return total
+        }
+        val top = Math.floor(bestBid / step) * step
+        val bids = (0 until 20).map { i -> (top - i * step).let { it to sum(it, minOf(it + step - 1, bestBid)) } }
+        val bottom = Math.ceil(bestAsk / step) * step
+        val asks = (0 until 20).map { i -> (bottom + i * step).let { it to sum(maxOf(it - step + 1, bestAsk), it) } }
+        fun side(levels: List<Pair<Double, Double>>) = levels.joinToString(",", "[", "]") { (p, q) -> """{"px":"${fmt(p)}","sz":"${fmt(q)}","n":3}""" }
+        return """{"coin":"BTC","time":$now,"levels":[${side(bids)},${side(asks)}]}"""
     }
 
     /** Kline stream: pushes an update of the current bar every 200 ms. */

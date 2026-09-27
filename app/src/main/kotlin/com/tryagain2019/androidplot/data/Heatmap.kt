@@ -4,6 +4,7 @@ import com.tryagain2019.androidplot.model.BookMarket
 import com.tryagain2019.androidplot.model.BookSnapshot
 import com.tryagain2019.androidplot.model.DAY
 import com.tryagain2019.androidplot.model.MINUTE
+import com.tryagain2019.androidplot.model.SECOND
 import com.tryagain2019.androidplot.model.Timeframe
 import kotlinx.coroutines.CancellationException
 import java.io.ByteArrayOutputStream
@@ -248,13 +249,25 @@ class HeatBuilder(val tf: Timeframe, val from: Long) {
         /** The quantity a [code] stands for (the page decodes the same way). */
         fun quantity(code: Int): Double = if (code <= 0) 0.0 else Math.pow(10.0, (code - 1) / 24.0 - 4)
 
-        /** Builds the heatmap of [tf] from what [store] recorded up to [now]. Blocking; stops early once [cancelled]. */
-        fun load(store: BookStore, market: BookMarket, tf: Timeframe, now: Long, cancelled: () -> Boolean = { false }): HeatBuilder {
+        /**
+         * Builds the heatmap of [tf] from what [store] recorded of [markets] up to [now], summing the
+         * books of each sampling round. Blocking; stops early once [cancelled].
+         */
+        fun load(store: BookStore, markets: Collection<BookMarket>, tf: Timeframe, now: Long, cancelled: () -> Boolean = { false }): HeatBuilder {
             val builder = HeatBuilder(tf, tf.barStart(now - window(tf)))
-            store.read(market, builder.from - MAX_HOLD, now + 1) {
-                if (cancelled()) throw CancellationException("heatmap no longer needed")
-                builder.add(it)
+            val merger = BookMerger()
+            val start = builder.from - MAX_HOLD
+            // A day at a time, so a month of five exchanges' snapshots is never in memory at once.
+            for (day in Math.floorDiv(start, DAY)..Math.floorDiv(now, DAY)) {
+                val from = maxOf(start, day * DAY)
+                val to = minOf(now + 1, (day + 1) * DAY)
+                val snapshots = markets.flatMap { m -> store.readList(m, from, to).map { m to it } }.sortedBy { it.second.time }
+                for ((market, s) in snapshots) {
+                    if (cancelled()) throw CancellationException("heatmap no longer needed")
+                    merger.add(market, s)?.let(builder::add)
+                }
             }
+            merger.flush()?.let(builder::add)
             return builder
         }
 
@@ -263,5 +276,37 @@ class HeatBuilder(val tf: Timeframe, val from: Long) {
             for (p in parts) out.write(p)
             return out.toByteArray()
         }
+    }
+}
+
+/**
+ * Turns the exchanges' snapshots into one combined book per sampling round: snapshots taken within
+ * [ROUND_GAP] of each other are one round, and the combined book sums every exchange's latest
+ * snapshot, as long as it is under [HeatBuilder.MAX_HOLD] old (so one exchange missing a round does
+ * not make its liquidity vanish).
+ */
+class BookMerger {
+    private val latest = HashMap<BookMarket, BookSnapshot>()
+    private var roundEnd = 0L
+    private var pending = false
+
+    /** Adds a snapshot (in time order); returns the combined book of the round it ends, if it ends one. */
+    fun add(market: BookMarket, s: BookSnapshot): BookSnapshot? {
+        val finished = if (pending && s.time - roundEnd > ROUND_GAP) combined() else null
+        latest[market] = s
+        roundEnd = maxOf(roundEnd, s.time)
+        pending = true
+        return finished
+    }
+
+    /** The combined book of the round in progress, if there is one. */
+    fun flush(): BookSnapshot? = if (pending) combined().also { pending = false } else null
+
+    private fun combined(): BookSnapshot? =
+        BookSnapshot.combine(roundEnd, latest.values.filter { it.time > roundEnd - HeatBuilder.MAX_HOLD })
+
+    companion object {
+        /** The app asks every exchange at once, so a round's snapshots are seconds apart. */
+        const val ROUND_GAP = 20 * SECOND
     }
 }

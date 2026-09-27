@@ -190,9 +190,57 @@ class HeatmapTest {
         store.append(BookMarket.SPOT, book(now - 2 * DAY, 84_000.0, 1f, 1f)) // before the 1m window (1 day)
         store.append(BookMarket.SPOT, book(now - 10 * MINUTE, 84_000.0, 1f, 1f))
         store.append(BookMarket.SPOT, book(now - 5 * MINUTE, 84_000.0, 2f, 1f))
-        val h = HeatBuilder.load(store, BookMarket.SPOT, Timeframe.M1, now)
+        val h = HeatBuilder.load(store, listOf(BookMarket.SPOT), Timeframe.M1, now)
         val bars = decode(h.encodeAll(now))
         assertEquals((0 until 10).map { now - 10 * MINUTE + it * MINUTE }, bars.map { it.time })
         assertEquals(HeatBuilder.code(2.0), bars.last().bids[1])
+    }
+
+    @Test
+    fun combinedBookSumsEveryExchange() {
+        val a = BookSnapshot(1, 84_500.0, 8449, floatArrayOf(1f, 2f), 8450, floatArrayOf(3f))
+        val b = BookSnapshot(2, 84_520.0, 8451, floatArrayOf(10f, 20f, 30f), 8449, floatArrayOf(5f, 6f, 7f))
+        val c = BookSnapshot.combine(3, listOf(a, b))!!
+        assertEquals(3, c.time)
+        near(84_510.0, c.mid)
+        assertEquals(8451, c.bidTop)
+        assertContentEquals(floatArrayOf(10f, 20f, 31f, 2f), c.bids) // bins 8451 down to 8448
+        assertEquals(8449, c.askBottom)
+        assertContentEquals(floatArrayOf(5f, 9f, 7f), c.asks) // bins 8449 up to 8451
+        assertNull(BookSnapshot.combine(0, emptyList()))
+    }
+
+    @Test
+    fun mergerSumsEachRoundAndCoversAnExchangeThatMissedOne() {
+        val m = com.tryagain2019.androidplot.data.BookMerger()
+        val t0 = t("2026-09-20T10:00:00Z")
+        assertNull(m.add(BookMarket.SPOT, book(t0, 84_500.0, 1f, 1f)))
+        assertNull(m.add(BookMarket.OKX, book(t0 + 900, 84_500.0, 2f, 2f)))
+        // The next round starts a minute later: the first round's sum comes out.
+        val first = m.add(BookMarket.SPOT, book(t0 + MINUTE, 84_500.0, 4f, 4f))!!
+        assertEquals(t0 + 900, first.time)
+        near(3.0, first.bids[0].toDouble())
+        // OKX failed in the second round: its last book still counts.
+        val second = m.flush()!!
+        near(6.0, second.bids[0].toDouble())
+        assertNull(m.flush())
+        // ... but not once it is older than 30 minutes.
+        m.add(BookMarket.SPOT, book(t0 + 40 * MINUTE, 84_500.0, 4f, 4f))
+        near(4.0, m.flush()!!.bids[0].toDouble())
+    }
+
+    @Test
+    fun loadSumsTheExchangesOfEachRound() {
+        val store = BookStore(tmp.newFolder("book"))
+        val now = t("2026-09-20T12:00:00Z")
+        for (i in 1..10) {
+            val time = now - i * MINUTE
+            store.append(BookMarket.SPOT, book(time, 84_000.0, 1f, 1f))
+            store.append(BookMarket.BYBIT, book(time + 1_500, 84_000.0, 2f, 2f))
+            store.append(BookMarket.HYPERLIQUID, book(time + 700, 84_000.0, 4f, 4f))
+        }
+        fun lastCode(markets: List<BookMarket>) = decode(HeatBuilder.load(store, markets, Timeframe.M1, now).encodeAll(now)).last().bids[1]
+        assertEquals(HeatBuilder.code(7.0), lastCode(listOf(BookMarket.SPOT, BookMarket.BYBIT, BookMarket.HYPERLIQUID)))
+        assertEquals(HeatBuilder.code(3.0), lastCode(listOf(BookMarket.SPOT, BookMarket.BYBIT))) // switched off: left out of the history too
     }
 }

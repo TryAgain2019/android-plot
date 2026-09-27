@@ -11,12 +11,14 @@ import android.util.Log
 import com.tryagain2019.androidplot.data.BookStore
 import com.tryagain2019.androidplot.model.BookMarket
 import com.tryagain2019.androidplot.model.MINUTE
-import com.tryagain2019.androidplot.net.BookApi
 import com.tryagain2019.androidplot.net.Http
+import com.tryagain2019.androidplot.net.OrderBooks
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
@@ -24,8 +26,8 @@ import kotlinx.coroutines.withTimeout
 import java.io.File
 
 /**
- * Records one order book snapshot about every 15 minutes while the app is closed, so the heatmap
- * keeps filling in (Binance has no order book history to download later).
+ * Records a snapshot of every enabled exchange's order book about every 15 minutes while the app
+ * is closed, so the heatmap keeps filling in (no exchange has order book history to download later).
  */
 class BookRecordJob : JobService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -36,21 +38,32 @@ class BookRecordJob : JobService() {
             getSystemService(JobScheduler::class.java)?.cancel(JOB_ID)
             return false
         }
-        val market = BookMarket.of(prefs.getString("heat.book", null)) ?: BookMarket.SPOT
+        val markets = BookMarket.enabled { prefs.getString(it, null) }
         val dir = File(filesDir, "book")
         scope.launch {
             try {
                 val store = BookStore.forDir(dir)
-                val last = store.lastTime(market)
-                // Skip when the app itself sampled a moment ago.
-                if (last == null || System.currentTimeMillis() - last > MIN_GAP) {
-                    val snapshot = withTimeout(60_000) { BookApi(Http.shared).snapshot(market) { System.currentTimeMillis() } }
-                    store.append(market, snapshot)
+                val books = OrderBooks.production(Http.shared)
+                withTimeout(90_000) {
+                    markets.map { market ->
+                        async {
+                            val last = store.lastTime(market)
+                            // Skip when the app itself sampled a moment ago.
+                            if (last != null && System.currentTimeMillis() - last < MIN_GAP) return@async
+                            try {
+                                store.append(market, books.snapshot(market) { System.currentTimeMillis() })
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                Log.d(TAG, "${market.displayName} order book failed: $e")
+                            }
+                        }
+                    }.awaitAll()
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.d(TAG, "order book snapshot failed: $e")
+                Log.d(TAG, "order book recording failed: $e")
             } finally {
                 jobFinished(params, false)
             }

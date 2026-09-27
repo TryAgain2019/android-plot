@@ -10,8 +10,8 @@
  *   price   {gen, mode: set|prepend|live, bars:[[t,o,h,l,c,volume]...]}
  *   oi      {gen, mode: set|live, bars:[[t,o,h,l,c]...]}
  *   funding {gen, mode: set|live, series:{hyperliquid:[[t,v]...], okx:..., binance:..., bybit:...}}
- *   heat    {gen, mode: set|live|off, market, name, binSize, since, data}   order book heatmap; data is
- *           base64 of bar records (see decodeHeat)
+ *   heat    {gen, mode: set|live|off, books, binSize, since, data}   order book heatmap (the sum of the
+ *           exchanges in books); data is base64 of bar records (see decodeHeat)
  *   busy    {gen, what: price|oi|funding, busy, detail}
  *   status  {live: ok|warn|error, sources:{key:{state, text}}}
  *   error   {gen, text}                                 shown as a banner with a retry button
@@ -51,6 +51,15 @@
     { key: 'hyperliquid', name: 'Hyperliquid', color: '#26c88e' },
   ];
   const LEGEND_ORDER = ['hyperliquid', 'okx', 'binance', 'bybit'];
+
+  // Order books the heatmap can add together, with the approximate size of one snapshot.
+  const BOOKS = [
+    { key: 'spot', name: 'Binance spot (5000 levels)', color: '#f5c6d6', kb: 60 },
+    { key: 'futures', name: 'Binance futures (1000 levels)', color: '#efa3bd', kb: 8 },
+    { key: 'bybit', name: 'Bybit (500 levels)', color: '#a7f0d8', kb: 4 },
+    { key: 'okx', name: 'OKX (5000 levels)', color: '#e83e78', kb: 49 },
+    { key: 'hyperliquid', name: 'Hyperliquid ($10 + $100 groups)', color: '#26c88e', kb: 1 },
+  ];
 
   const TIMEFRAMES = [
     { code: '1m', label: '1m', sec: 60 },
@@ -282,11 +291,15 @@
       tz: 'local',
       oi: { binance: true, bybit: true, okx: true, hyperliquid: true },
       funding: { binance: true, bybit: true, okx: true, hyperliquid: true },
-      heat: { on: true, book: 'spot', bg: 'any', lo: 0, hi: 0.8 },
+      heat: {
+        on: true,
+        books: { spot: true, futures: true, bybit: true, okx: true, hyperliquid: true },
+        bg: 'any',
+        lo: 0,
+        hi: 0.8,
+      },
     },
     heat: {
-      market: 'spot',
-      name: '',
       binSize: 10,
       since: null, // first recorded snapshot (UTC seconds)
       bars: new Map(), // display time -> record
@@ -782,8 +795,10 @@
   // While the recording is young, say where the heatmap starts (or why nothing is recorded).
   function heatNote() {
     if (!heatOn()) return '';
-    const book = state.sources.book;
-    if (book && book.state === 'error') return `<span class="muted">Order book: ${esc(book.text)}</span>`;
+    const books = BOOKS.filter(b => state.settings.heat.books[b.key]);
+    if (!books.length) return '<span class="muted">Order book heatmap: no exchange selected (ⓘ)</span>';
+    const states = books.map(b => state.sources['book.' + b.key]);
+    if (states.every(st => st && st.state === 'error')) return `<span class="muted">Order book: ${esc(states[0].text)}</span>`;
     const since = state.heat.since;
     if (since === null) return '<span class="muted">Order book heatmap: recording…</span>';
     if (Date.now() / 1000 - since > 7 * 86400) return '';
@@ -975,15 +990,20 @@
     });
     box.appendChild(toggle);
     if (!heat.on) return;
-    box.appendChild(segRow('Order book', [['spot', 'Spot'], ['futures', 'Futures']], heat.book, v => {
-      heat.book = v;
-      state.heat.bars = new Map();
-      state.heat.since = null;
-      state.heat.version++;
-      applyHeatVisibility();
-      call('setSetting', 'heat.book', v);
-      renderHeatSettings();
-    }));
+    const label = document.createElement('p');
+    label.className = 'small';
+    label.textContent = 'Order books added together (each exchange is recorded on its own):';
+    box.appendChild(label);
+    for (const b of BOOKS) {
+      box.appendChild(toggleRow(b.name, b.color, !!heat.books[b.key], on => {
+        heat.books[b.key] = on;
+        state.heat.bars = new Map();
+        state.heat.version++;
+        applyHeatVisibility();
+        call('setSetting', 'book.' + b.key, on ? 'true' : 'false');
+        renderHeatSettings();
+      }));
+    }
     box.appendChild(segRow('Record while closed', [['off', 'Off'], ['wifi', 'Wi-Fi'], ['any', 'Always']], heat.bg, v => {
       heat.bg = v;
       call('setSetting', 'heat.bg', v);
@@ -992,10 +1012,11 @@
     const since = state.heat.since;
     const note = document.createElement('p');
     note.className = 'small';
+    const kb = BOOKS.filter(b => heat.books[b.key]).reduce((sum, b) => sum + b.kb, 0);
+    const mb = v => (v < 1 ? v.toFixed(1) : Math.round(v)) + ' MB';
     note.textContent = (since ? `Recorded since ${fmtSince.format(new Date(since * 1000))}. ` : 'Nothing recorded yet. ') +
-      (heat.book === 'spot'
-        ? 'A spot snapshot (5000 price levels a side) is about 60 KB: roughly 4 MB an hour while the app is open, 6 MB a day while closed.'
-        : 'A futures snapshot (1000 price levels a side) is about 8 KB: under 1 MB a day while closed.');
+      `One snapshot of these books is about ${kb} KB: roughly ${mb(kb * 60 / 1024)} an hour while the app is open, ` +
+      `${mb(kb * 96 / 1024)} a day while closed.`;
     box.appendChild(note);
   }
 
@@ -1133,8 +1154,6 @@
       state.settings.heat.on = true;
       if (msg.mode === 'set') {
         h.bars = new Map();
-        h.market = msg.market || h.market;
-        h.name = msg.name || h.name;
         h.binSize = msg.binSize || h.binSize;
       }
       if (msg.since !== undefined) h.since = msg.since;
@@ -1154,9 +1173,10 @@
   function onStatus(msg) {
     const dot = document.getElementById('status-dot');
     dot.className = msg.live === 'ok' ? 'ok' : msg.live === 'error' ? 'error' : msg.live === 'warn' ? 'warn' : '';
-    const bookBefore = JSON.stringify(state.sources.book || null);
+    const bookStates = () => BOOKS.map(b => (state.sources['book.' + b.key] || {}).state).join();
+    const before = bookStates();
     if (msg.sources) state.sources = msg.sources;
-    if (JSON.stringify(state.sources.book || null) !== bookBefore) updateLegends();
+    if (bookStates() !== before) updateLegends();
     if (sheet.classList.contains('open')) renderSheet();
   }
 
@@ -1169,7 +1189,7 @@
       if (s.heat) {
         const heat = state.settings.heat;
         heat.on = s.heat.on !== false;
-        heat.book = s.heat.book || heat.book;
+        if (s.heat.books) Object.assign(heat.books, s.heat.books);
         heat.bg = s.heat.bg || heat.bg;
         const lo = parseFloat(s.heat.lo);
         const hi = parseFloat(s.heat.hi);

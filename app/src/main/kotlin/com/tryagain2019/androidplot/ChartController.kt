@@ -2,6 +2,7 @@ package com.tryagain2019.androidplot
 
 import com.tryagain2019.androidplot.data.BinanceFundingHistory
 import com.tryagain2019.androidplot.data.BinanceOiHistory
+import com.tryagain2019.androidplot.data.BookMerger
 import com.tryagain2019.androidplot.data.BookStore
 import com.tryagain2019.androidplot.data.BybitFundingHistory
 import com.tryagain2019.androidplot.data.BybitOiHistory
@@ -34,6 +35,7 @@ import com.tryagain2019.androidplot.net.BookApi
 import com.tryagain2019.androidplot.net.BybitApi
 import com.tryagain2019.androidplot.net.HyperliquidApi
 import com.tryagain2019.androidplot.net.OkxApi
+import com.tryagain2019.androidplot.net.OrderBooks
 import com.tryagain2019.androidplot.net.PriceFeed
 import com.tryagain2019.androidplot.net.ApiException
 import com.tryagain2019.androidplot.net.HttpException
@@ -73,6 +75,8 @@ class Apis(
     val book: BookApi,
     val socketBases: List<String> = listOf("wss://fstream.binance.com/ws/", "wss://fstream.binance.com/market/ws/"),
 ) {
+    val books = OrderBooks(book, bybit, okx, hyperliquid)
+
     companion object {
         fun production(client: OkHttpClient, archiveCache: File) = Apis(
             client = client,
@@ -197,8 +201,9 @@ class ChartController(
     private var heatJob: Job? = null
     private var bookJob: Job? = null
 
-    /** Snapshots taken this session, applied again after the heatmap is (re)built from disk. */
+    /** Combined books of this session's rounds, applied again after the heatmap is (re)built from disk. */
     private val recentBook = ArrayDeque<BookSnapshot>()
+    private var liveMerger = BookMerger()
 
     private val sourceStates = LinkedHashMap<String, Source>()
     private val liveStates = EnumMap<Exchange, Source>(Exchange::class.java)
@@ -267,12 +272,13 @@ class ChartController(
         settings.put(key, value)
         when {
             key == "tz" -> resendAll()
-            key == "heat" || key == "heat.book" -> {
+            key == "heat" || key.startsWith("book.") -> {
                 bookJob?.cancel()
                 bookJob = null
                 recentBook.clear()
+                liveMerger = BookMerger()
                 heat = null
-                sourceStates.remove("book")
+                sourceStates.keys.removeAll { it.startsWith("book.") }
                 queueStatus()
                 reloadHeat()
                 startBookSampler()
@@ -790,7 +796,7 @@ class ChartController(
 
     private fun heatOn() = settings.get("heat") != "off"
 
-    private fun bookMarket() = BookMarket.of(settings.get("heat.book")) ?: BookMarket.SPOT
+    private fun enabledBooks() = BookMarket.enabled(settings::get)
 
     /** (Re)builds the current timeframe's heatmap from the recorded snapshots. */
     private fun reloadHeat() {
@@ -804,13 +810,13 @@ class ChartController(
             publishHeat()
             return
         }
-        val market = bookMarket()
+        val markets = enabledBooks()
         val frame = tf
         val now = clock()
         val (built, since) = withContext(Dispatchers.IO) {
-            HeatBuilder.load(bookStore, market, frame, now) { !isActive } to bookStore.firstTime(market)
+            HeatBuilder.load(bookStore, markets, frame, now) { !isActive } to markets.mapNotNull { bookStore.firstTime(it) }.minOrNull()
         }
-        if (g != loadGen || frame != tf || market != bookMarket() || !heatOn()) return
+        if (g != loadGen || frame != tf || markets != enabledBooks() || !heatOn()) return
         // Snapshots taken while loading may not have reached the disk yet.
         for (s in recentBook) built.add(s)
         heat = built
@@ -822,30 +828,39 @@ class ChartController(
         if (!started || !heatOn() || bookJob?.isActive == true) return
         bookJob = scope.launch {
             while (isActive) {
-                val market = bookMarket()
                 val t0 = clock()
-                try {
-                    val snapshot = withTimeout(30_000) { apis.book.snapshot(market, clock) }
-                    onBookSnapshot(market, snapshot)
-                } catch (e: TimeoutCancellationException) {
-                    setSource("book", bookSourceName(market), false, "timed out")
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    setSource("book", bookSourceName(market), false, describeError(e))
-                }
+                sampleBooks(enabledBooks())
                 delay(maxOf(1_000L, bookIntervalMs - (clock() - t0)))
             }
         }
     }
 
-    private fun onBookSnapshot(market: BookMarket, s: BookSnapshot) {
-        if (market != bookMarket() || !heatOn()) return
+    /** One round: every enabled exchange's book at once; each is stored, and their sum goes into the heatmap. */
+    private suspend fun sampleBooks(markets: List<BookMarket>) {
+        if (markets.isEmpty()) return
+        val results = coroutineScope {
+            markets.map { m -> async { m to runCatching { withTimeout(30_000) { apis.books.snapshot(m, clock) } } } }.awaitAll()
+        }
+        if (markets != enabledBooks() || !heatOn()) return
+        for ((market, result) in results) {
+            val error = result.exceptionOrNull()
+            if (error is CancellationException && error !is TimeoutCancellationException) throw error
+            val snapshot = result.getOrNull()
+            if (snapshot == null) {
+                setSource("book.${market.key}", bookSourceName(market), false, if (error is TimeoutCancellationException) "timed out" else describeError(error!!))
+                continue
+            }
+            writer.execute { bookStore.append(market, snapshot) }
+            liveMerger.add(market, snapshot)
+            setSource("book.${market.key}", bookSourceName(market), true, describeBook(snapshot))
+        }
+        liveMerger.flush()?.let(::onCombinedBook)
+    }
+
+    private fun onCombinedBook(s: BookSnapshot) {
         recentBook.addLast(s)
         while (recentBook.size > 64) recentBook.removeFirst()
-        writer.execute { bookStore.append(market, s) }
         if (heatSince == null) heatSince = s.time
-        setSource("book", bookSourceName(market), true, describeBook(s))
         val h = heat ?: return
         val changed = h.add(s)
         if (changed.isEmpty()) return
@@ -867,18 +882,17 @@ class ChartController(
             return
         }
         val h = heat ?: return
-        val market = bookMarket()
         val data = h.encodeAll(clock())
         message(json {
             str("type", "heat"); num("gen", gen); str("mode", "set")
-            str("market", market.key); str("name", market.displayName)
+            raw("books", enabledBooks().joinToString(",", "[", "]") { "\"${it.key}\"" })
             num("binSize", h.binSize)
             raw("since", heatSince?.let { (it / 1000).toString() } ?: "null")
             raw("data", "\"" + Base64.getEncoder().encodeToString(data) + "\"")
         })
     }
 
-    private fun bookSourceName(market: BookMarket) = "Order book (${market.displayName})"
+    private fun bookSourceName(market: BookMarket) = "Order book: ${market.displayName}"
 
     private fun describeBook(s: BookSnapshot): String {
         val reach = maxOf(s.mid - s.low, s.high - s.mid) / s.mid * 100
@@ -966,7 +980,7 @@ class ChartController(
                 key("funding").obj { for (ex in Exchange.entries) bool(ex.key, settings.get("funding.${ex.key}") != "false") }
                 key("heat").obj {
                     bool("on", heatOn())
-                    str("book", bookMarket().key)
+                    key("books").obj { for (m in BookMarket.entries) bool(m.key, settings.get("book.${m.key}") != "false") }
                     str("bg", settings.get("heat.bg") ?: "any")
                     str("lo", settings.get("heat.lo"))
                     str("hi", settings.get("heat.hi"))
@@ -1037,7 +1051,7 @@ class ChartController(
             val live = when {
                 price?.ok == false -> "error"
                 price == null -> "pending"
-                exchanges.any { it.ok == false } || sourceStates["book"]?.ok == false -> "warn"
+                exchanges.any { it.ok == false } || sourceStates.any { (k, s) -> k.startsWith("book.") && s.ok == false } -> "warn"
                 else -> "ok"
             }
             val body = json {

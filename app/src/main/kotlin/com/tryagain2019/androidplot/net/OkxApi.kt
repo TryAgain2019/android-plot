@@ -1,5 +1,6 @@
 package com.tryagain2019.androidplot.net
 
+import com.tryagain2019.androidplot.model.BookSnapshot
 import com.tryagain2019.androidplot.model.FundingEvent
 import com.tryagain2019.androidplot.model.LiveFunding
 import com.tryagain2019.androidplot.model.Sample
@@ -36,6 +37,10 @@ class OkxApi(
     /** The funding rate accruing now, settled at the returned next funding time. */
     suspend fun fundingRate(): LiveFunding =
         client.get("$base/api/v5/public/funding-rate?instId=$instId", OkxParsers::fundingRate)
+
+    /** The current order book, [size] levels a side (at most 5000); rate limited to 5 calls per 2 s. */
+    suspend fun orderBook(size: Int, time: () -> Long): BookSnapshot =
+        client.get("$base/api/v5/market/books-full?instId=$instId&sz=$size") { OkxParsers.orderBook(it, time(), OkxParsers.CONTRACT_BTC) }
 
     /** Up to 100 settled funding rates older than [after] (newest first when [after] is null). OKX keeps ~3 months. */
     suspend fun fundingRateHistory(after: Long?, limit: Int = 100): List<FundingEvent> {
@@ -76,6 +81,14 @@ object OkxParsers {
         return Sample(o.long("ts") ?: System.currentTimeMillis(), v)
     }
 
+    /** `data[0].bids/asks`, best first, as `[price, size, orders]`; swap sizes are contracts of [contractBtc]. */
+    fun orderBook(json: String, time: Long, contractBtc: Double): BookSnapshot {
+        val o = data(json).optJSONObject(0) ?: throw ApiException("OKX: no order book")
+        val (bidPrices, bidSizes) = bookLevels(o.optJSONArray("bids"), contractBtc)
+        val (askPrices, askSizes) = bookLevels(o.optJSONArray("asks"), contractBtc)
+        return BookSnapshot.fromLevels(time, bidPrices, bidSizes, askPrices, askSizes) ?: throw ApiException("OKX: empty order book")
+    }
+
     fun fundingRate(json: String): LiveFunding {
         val o = data(json).optJSONObject(0) ?: throw ApiException("OKX: no funding rate")
         val r = o.num("fundingRate")
@@ -94,6 +107,6 @@ object OkxParsers {
         return out.sortedBy { it.time }
     }
 
-    /** BTC-USDT-SWAP contract value, used only if a response lacks the coin-denominated field. */
-    private const val CONTRACT_BTC = 0.01
+    /** BTC-USDT-SWAP contract value (order book sizes, and OI when a response lacks the coin field). */
+    const val CONTRACT_BTC = 0.01
 }

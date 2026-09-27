@@ -11,6 +11,7 @@ import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
@@ -159,5 +160,60 @@ class ParsersTest {
     fun errorDetails() {
         assertEquals("Service unavailable from a restricted location", errorDetail("""{"code":0,"msg":"Service unavailable from a restricted location"}"""))
         assertEquals("", errorDetail("<html>403 Forbidden</html>"))
+    }
+
+    @Test
+    fun bybitOrderBook() {
+        val json = """{"retCode":0,"retMsg":"OK","result":{"s":"BTCUSDT","a":[["84500.1","16.606"],["84512.0","2.5"]],"b":[["84499.9","47.08"],["84489.5","1.2"]],
+            "ts":1716863719031,"u":230704,"seq":1432604333,"cts":1716863718905},"retExtInfo":{},"time":1716863719382}"""
+        val s = BybitParsers.orderBook(json, 5)
+        assertEquals(8449, s.bidTop)
+        assertContentEquals(floatArrayOf(47.08f, 1.2f), s.bids)
+        assertEquals(8450, s.askBottom)
+        assertEquals(16.606f, s.asks[0])
+        assertEquals(2.5f, s.asks[1])
+        assertFailsWith<ApiException> { BybitParsers.orderBook("""{"retCode":10001,"retMsg":"params error","result":{}}""", 0) }
+    }
+
+    @Test
+    fun okxOrderBookInContracts() {
+        val json = """{"code":"0","msg":"","data":[{"asks":[["84500.1","1200","3"]],"bids":[["84499.9","250","5"],["84480.0","100","1"]],"ts":"1629966436396"}]}"""
+        val s = OkxParsers.orderBook(json, 5, 0.01)
+        assertEquals(8449, s.bidTop)
+        assertEquals(2.5f, s.bids[0]) // 250 contracts of 0.01 BTC
+        assertEquals(1.0f, s.bids[1])
+        assertEquals(12.0f, s.asks[0])
+        assertFailsWith<ApiException> { OkxParsers.orderBook("""{"code":"51001","msg":"Instrument ID does not exist","data":[]}""", 0, 0.01) }
+    }
+
+    @Test
+    fun hyperliquidBookFromTwoGroupings() {
+        // $10 levels near the price, $100 levels further out (bids rounded down, asks up).
+        val fine = HyperliquidParsers.l2Book(
+            """{"coin":"BTC","time":1754450974231,"levels":[
+            [{"px":"84490.0","sz":"2.0","n":3},{"px":"84480.0","sz":"1.0","n":1}],
+            [{"px":"84500.0","sz":"3.0","n":2},{"px":"84510.0","sz":"1.5","n":1}]]}""",
+        )
+        val coarse = HyperliquidParsers.l2Book(
+            """{"coin":"BTC","time":1754450974231,"levels":[
+            [{"px":"84400.0","sz":"23.0","n":9},{"px":"84300.0","sz":"10.0","n":4}],
+            [{"px":"84500.0","sz":"3.0","n":2},{"px":"84600.0","sz":"11.5","n":5}]]}""",
+        )
+        assertEquals(10.0, HyperliquidParsers.step(84_490.0, 4))
+        assertEquals(100.0, HyperliquidParsers.step(84_490.0, 3))
+        val s = HyperliquidParsers.snapshot(9, fine, 4, coarse, 3)!!
+        // Bids: 84490 and 84480 as sent; the 84400 level (23 BTC, of which the fine levels hold 3)
+        // spreads the other 20 over 84400-84480 (8 bins of 2.5); 84300 spreads 10 over 10 bins.
+        assertEquals(8449, s.bidTop)
+        assertContentEquals(floatArrayOf(2f, 1f), s.bids.copyOfRange(0, 2))
+        for (j in 2 until 10) assertEquals(2.5f, s.bids[j], "bin ${s.bidTop - j}")
+        for (j in 10 until 20) assertEquals(1f, s.bids[j], 1e-6f)
+        // Asks: level 84500 holds (84490, 84500], i.e. the 84490 bin; 84510 the 84500 bin. The
+        // 84600 level, (84500, 84600], is 11.5 minus the fine 1.5, spread over its 9 bins above 84510.
+        assertEquals(8449, s.askBottom)
+        assertEquals(3f, s.asks[0])
+        assertEquals(1.5f, s.asks[1])
+        assertEquals(11, s.asks.size)
+        for (j in 2 until 11) assertEquals(10f / 9, s.asks[j], 1e-5f)
     }
 }
