@@ -81,14 +81,15 @@ class MainActivity : Activity() {
 
         controller = ChartController(
             scope = scope,
-            apis = Apis.production(Http.newClient(), File(filesDir, "binance-archive")),
-            settings = PrefsStore(getSharedPreferences("settings", MODE_PRIVATE)),
+            apis = Apis.production(Http.shared, File(filesDir, "binance-archive")),
+            settings = PrefsStore(getSharedPreferences(BookRecordJob.PREFS, MODE_PRIVATE)),
             dataDir = filesDir,
             versionName = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull() ?: "",
             send = { script -> if (!isDestroyed) webView.evaluateJavascript(script, null) },
         )
         webView.addJavascriptInterface(Bridge(), "AndroidBridge")
         webView.loadUrl("file:///android_asset/chart/index.html")
+        BookRecordJob.schedule(this)
     }
 
     override fun onStart() {
@@ -154,7 +155,10 @@ class MainActivity : Activity() {
             post { controller.onVisibleRange(gen, fromSec, toSec, logicalFrom) }
 
         @JavascriptInterface
-        fun setSetting(key: String, value: String) = post { controller.setSetting(key, value) }
+        fun setSetting(key: String, value: String) = post {
+            controller.setSetting(key, value)
+            if (key == "heat" || key == "heat.bg") BookRecordJob.schedule(this@MainActivity)
+        }
 
         @JavascriptInterface
         fun retry() = post { controller.retry() }

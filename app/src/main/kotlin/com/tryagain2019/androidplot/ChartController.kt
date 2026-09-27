@@ -2,10 +2,12 @@ package com.tryagain2019.androidplot
 
 import com.tryagain2019.androidplot.data.BinanceFundingHistory
 import com.tryagain2019.androidplot.data.BinanceOiHistory
+import com.tryagain2019.androidplot.data.BookStore
 import com.tryagain2019.androidplot.data.BybitFundingHistory
 import com.tryagain2019.androidplot.data.BybitOiHistory
 import com.tryagain2019.androidplot.data.FundingAggregator
 import com.tryagain2019.androidplot.data.FundingRepository
+import com.tryagain2019.androidplot.data.HeatBuilder
 import com.tryagain2019.androidplot.data.HistoryStore
 import com.tryagain2019.androidplot.data.HyperliquidFundingHistory
 import com.tryagain2019.androidplot.data.LiveOiRecorder
@@ -15,6 +17,8 @@ import com.tryagain2019.androidplot.data.OkxFundingHistory
 import com.tryagain2019.androidplot.data.OkxOiHistory
 import com.tryagain2019.androidplot.data.Pacer
 import com.tryagain2019.androidplot.data.StoredSeries
+import com.tryagain2019.androidplot.model.BookMarket
+import com.tryagain2019.androidplot.model.BookSnapshot
 import com.tryagain2019.androidplot.model.Candle
 import com.tryagain2019.androidplot.model.DAY
 import com.tryagain2019.androidplot.model.Exchange
@@ -26,6 +30,7 @@ import com.tryagain2019.androidplot.model.Sample
 import com.tryagain2019.androidplot.model.Timeframe
 import com.tryagain2019.androidplot.net.BinanceApi
 import com.tryagain2019.androidplot.net.BinanceArchive
+import com.tryagain2019.androidplot.net.BookApi
 import com.tryagain2019.androidplot.net.BybitApi
 import com.tryagain2019.androidplot.net.HyperliquidApi
 import com.tryagain2019.androidplot.net.OkxApi
@@ -50,6 +55,7 @@ import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import java.io.File
 import java.io.IOException
+import java.util.Base64
 import java.util.EnumMap
 import java.util.EnumSet
 import java.util.Locale
@@ -64,6 +70,7 @@ class Apis(
     val okx: OkxApi,
     val hyperliquid: HyperliquidApi,
     val archive: BinanceArchive,
+    val book: BookApi,
     val socketBases: List<String> = listOf("wss://fstream.binance.com/ws/", "wss://fstream.binance.com/market/ws/"),
 ) {
     companion object {
@@ -74,6 +81,7 @@ class Apis(
             okx = OkxApi(client),
             hyperliquid = HyperliquidApi(client),
             archive = BinanceArchive(client, archiveCache),
+            book = BookApi(client),
         )
     }
 }
@@ -95,6 +103,8 @@ class ChartController(
     private val versionName: String,
     private val clock: () -> Long = System::currentTimeMillis,
     private val pollIntervalMs: Long = 5_000,
+    /** How often the order book is sampled for the heatmap while the app is open. */
+    private val bookIntervalMs: Long = 60_000,
     /** Receives JavaScript statements for the WebView. */
     private val send: (String) -> Unit,
 ) {
@@ -102,6 +112,7 @@ class ChartController(
     private val okxOiPacer = Pacer(420)
     private val okxFundingPacer = Pacer(220)
     private val store = HistoryStore(File(dataDir, "history"))
+    private val bookStore = BookStore.forDir(File(dataDir, "book"))
     private val recorder = LiveOiRecorder(dataDir)
     private val oiRepo = OiRepository(
         mapOf(
@@ -180,6 +191,15 @@ class ChartController(
 
     private class Source(val name: String, val ok: Boolean?, val text: String)
 
+    /** Order book heatmap of the current timeframe; null while it loads or when switched off. */
+    private var heat: HeatBuilder? = null
+    private var heatSince: Long? = null
+    private var heatJob: Job? = null
+    private var bookJob: Job? = null
+
+    /** Snapshots taken this session, applied again after the heatmap is (re)built from disk. */
+    private val recentBook = ArrayDeque<BookSnapshot>()
+
     private val sourceStates = LinkedHashMap<String, Source>()
     private val liveStates = EnumMap<Exchange, Source>(Exchange::class.java)
     private val historyErrors = EnumMap<Exchange, MutableMap<String, String>>(Exchange::class.java)
@@ -203,6 +223,7 @@ class ChartController(
         val pausedFor = stoppedAt?.let { clock() - it }
         stoppedAt = null
         startPolling()
+        startBookSampler()
         when {
             loadJob == null -> switchTo(tf)
             priceLoaded -> {
@@ -210,6 +231,8 @@ class ChartController(
                 if (pausedFor != null && pausedFor > MINUTE) refreshAfterPause()
             }
         }
+        // The background job kept recording while the app was away; rebuild from disk to include it.
+        if (pausedFor != null && pausedFor > MINUTE && heat != null) reloadHeat()
     }
 
     fun onStop() {
@@ -219,6 +242,8 @@ class ChartController(
         feed.stop()
         pollJob?.cancel()
         pollJob = null
+        bookJob?.cancel()
+        bookJob = null
         saveJob?.cancel()
         saveNow()
     }
@@ -226,6 +251,7 @@ class ChartController(
     fun destroy() {
         onStop()
         loadJob?.cancel()
+        heatJob?.cancel()
         prefetchJob?.cancel()
     }
 
@@ -241,6 +267,16 @@ class ChartController(
         settings.put(key, value)
         when {
             key == "tz" -> resendAll()
+            key == "heat" || key == "heat.book" -> {
+                bookJob?.cancel()
+                bookJob = null
+                recentBook.clear()
+                heat = null
+                sourceStates.remove("book")
+                queueStatus()
+                reloadHeat()
+                startBookSampler()
+            }
             key.startsWith("oi.") -> {
                 val ex = Exchange.of(key.removePrefix("oi.")) ?: return
                 if (value == "true" && ex.hasOiHistory && oiFrom != null) {
@@ -300,8 +336,10 @@ class ChartController(
         lastOi = emptyList()
         lastFunding.clear()
         busyStates.clear()
+        heat = null
         sendReset()
         loadJob = scope.launch { initialLoad(g) }
+        reloadHeat()
     }
 
     /**
@@ -748,6 +786,105 @@ class ChartController(
         }
     }
 
+    // ------------------------------------------------------------------ order book heatmap
+
+    private fun heatOn() = settings.get("heat") != "off"
+
+    private fun bookMarket() = BookMarket.of(settings.get("heat.book")) ?: BookMarket.SPOT
+
+    /** (Re)builds the current timeframe's heatmap from the recorded snapshots. */
+    private fun reloadHeat() {
+        heatJob?.cancel()
+        val g = loadGen
+        heatJob = scope.launch { loadHeat(g) }
+    }
+
+    private suspend fun loadHeat(g: Int) {
+        if (!heatOn()) {
+            publishHeat()
+            return
+        }
+        val market = bookMarket()
+        val frame = tf
+        val now = clock()
+        val (built, since) = withContext(Dispatchers.IO) {
+            HeatBuilder.load(bookStore, market, frame, now) { !isActive } to bookStore.firstTime(market)
+        }
+        if (g != loadGen || frame != tf || market != bookMarket() || !heatOn()) return
+        // Snapshots taken while loading may not have reached the disk yet.
+        for (s in recentBook) built.add(s)
+        heat = built
+        heatSince = since ?: recentBook.firstOrNull()?.time
+        publishHeat()
+    }
+
+    private fun startBookSampler() {
+        if (!started || !heatOn() || bookJob?.isActive == true) return
+        bookJob = scope.launch {
+            while (isActive) {
+                val market = bookMarket()
+                val t0 = clock()
+                try {
+                    val snapshot = withTimeout(30_000) { apis.book.snapshot(market, clock) }
+                    onBookSnapshot(market, snapshot)
+                } catch (e: TimeoutCancellationException) {
+                    setSource("book", bookSourceName(market), false, "timed out")
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    setSource("book", bookSourceName(market), false, describeError(e))
+                }
+                delay(maxOf(1_000L, bookIntervalMs - (clock() - t0)))
+            }
+        }
+    }
+
+    private fun onBookSnapshot(market: BookMarket, s: BookSnapshot) {
+        if (market != bookMarket() || !heatOn()) return
+        recentBook.addLast(s)
+        while (recentBook.size > 64) recentBook.removeFirst()
+        writer.execute { bookStore.append(market, s) }
+        if (heatSince == null) heatSince = s.time
+        setSource("book", bookSourceName(market), true, describeBook(s))
+        val h = heat ?: return
+        val changed = h.add(s)
+        if (changed.isEmpty()) return
+        val data = h.encodeBars(changed, clock())
+        if (data.isNotEmpty()) {
+            message(json {
+                str("type", "heat"); num("gen", gen); str("mode", "live")
+                raw("since", heatSince?.let { (it / 1000).toString() } ?: "null")
+                raw("data", "\"" + Base64.getEncoder().encodeToString(data) + "\"")
+            })
+        }
+    }
+
+    /** Sends the whole heatmap (or that it is switched off). */
+    private fun publishHeat() {
+        if (!pageReady) return
+        if (!heatOn()) {
+            message(json { str("type", "heat"); num("gen", gen); str("mode", "off") })
+            return
+        }
+        val h = heat ?: return
+        val market = bookMarket()
+        val data = h.encodeAll(clock())
+        message(json {
+            str("type", "heat"); num("gen", gen); str("mode", "set")
+            str("market", market.key); str("name", market.displayName)
+            num("binSize", h.binSize)
+            raw("since", heatSince?.let { (it / 1000).toString() } ?: "null")
+            raw("data", "\"" + Base64.getEncoder().encodeToString(data) + "\"")
+        })
+    }
+
+    private fun bookSourceName(market: BookMarket) = "Order book (${market.displayName})"
+
+    private fun describeBook(s: BookSnapshot): String {
+        val reach = maxOf(s.mid - s.low, s.high - s.mid) / s.mid * 100
+        return String.format(Locale.US, "live \u00b7 %,.0f\u2013%,.0f (\u00b1%.1f%%)", s.low, s.high, reach)
+    }
+
     // ------------------------------------------------------------------ building and sending panes
 
     private fun enabledOiExchanges(): List<Exchange> = Exchange.entries.filter { settings.get("oi.${it.key}") != "false" }
@@ -827,6 +964,13 @@ class ChartController(
                 str("tz", settings.get("tz") ?: "local")
                 key("oi").obj { for (ex in Exchange.entries) bool(ex.key, settings.get("oi.${ex.key}") != "false") }
                 key("funding").obj { for (ex in Exchange.entries) bool(ex.key, settings.get("funding.${ex.key}") != "false") }
+                key("heat").obj {
+                    bool("on", heatOn())
+                    str("book", bookMarket().key)
+                    str("bg", settings.get("heat.bg") ?: "any")
+                    str("lo", settings.get("heat.lo"))
+                    str("hi", settings.get("heat.hi"))
+                }
             }
         })
     }
@@ -839,7 +983,7 @@ class ChartController(
     }
 
     private fun sendPrice(mode: String, bars: List<Candle>) {
-        message(json { str("type", "price"); num("gen", gen); str("mode", mode); candles("bars", bars, 2) })
+        message(json { str("type", "price"); num("gen", gen); str("mode", mode); candles("bars", bars, 2, volumeDecimals = 3) })
     }
 
     /** Re-sends everything held in memory under a new generation (page reload, time zone change). */
@@ -851,6 +995,7 @@ class ChartController(
         lastFunding.clear()
         publishOi(force = true)
         publishFunding(force = true)
+        publishHeat()
         for ((what, detail) in busyStates.toList()) busy(what, true, detail)
     }
 
@@ -892,7 +1037,7 @@ class ChartController(
             val live = when {
                 price?.ok == false -> "error"
                 price == null -> "pending"
-                exchanges.any { it.ok == false } -> "warn"
+                exchanges.any { it.ok == false } || sourceStates["book"]?.ok == false -> "warn"
                 else -> "ok"
             }
             val body = json {

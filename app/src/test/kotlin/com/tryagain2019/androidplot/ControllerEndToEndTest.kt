@@ -1,10 +1,15 @@
 package com.tryagain2019.androidplot
 
+import com.tryagain2019.androidplot.data.BookStore
+import com.tryagain2019.androidplot.data.HeatBuilder
+import com.tryagain2019.androidplot.model.BookMarket
 import com.tryagain2019.androidplot.model.DAY
 import com.tryagain2019.androidplot.model.HOUR
 import com.tryagain2019.androidplot.model.Timeframe
 import com.tryagain2019.androidplot.net.BinanceApi
 import com.tryagain2019.androidplot.net.BinanceArchive
+import com.tryagain2019.androidplot.net.BookApi
+import com.tryagain2019.androidplot.net.BookParsers
 import com.tryagain2019.androidplot.net.BybitApi
 import com.tryagain2019.androidplot.net.HyperliquidApi
 import com.tryagain2019.androidplot.net.OkxApi
@@ -23,6 +28,7 @@ import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import org.junit.rules.TestName
 import java.io.File
+import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -50,6 +56,7 @@ class ControllerEndToEndTest {
     private val messages = CopyOnWriteArrayList<JSONObject>()
     private val settings = HashMap<String, String>()
     private lateinit var controller: ChartController
+    private lateinit var dataDir: File
 
     private class MapSettings(private val map: MutableMap<String, String>) : SettingsStore {
         override fun get(key: String) = synchronized(map) { map[key] }
@@ -69,10 +76,12 @@ class ControllerEndToEndTest {
             okx = OkxApi(client, base),
             hyperliquid = HyperliquidApi(client, base),
             archive = BinanceArchive(client, tmp.newFolder("archive"), base),
+            book = BookApi(client, spotBases = listOf(base), futuresBase = base),
             socketBases = listOf(base.replaceFirst("http", "ws") + "/ws/"),
         )
         settings["tf"] = "1d"
-        controller = ChartController(scope, apis, MapSettings(settings), tmp.newFolder("data"), "test", pollIntervalMs = 400) { js ->
+        dataDir = tmp.newFolder("data")
+        controller = ChartController(scope, apis, MapSettings(settings), dataDir, "test", pollIntervalMs = 400, bookIntervalMs = 300) { js ->
             val prefix = "window.chartApp&&chartApp.receive("
             assertTrue(js.startsWith(prefix) && js.endsWith(");"), js.take(80))
             messages += JSONObject(js.substring(prefix.length, js.length - 2))
@@ -172,6 +181,84 @@ class ControllerEndToEndTest {
         for (key in listOf("price", "binance", "bybit", "okx", "hyperliquid")) {
             assertEquals("ok", sources.getJSONObject(key).getString("state"), key)
         }
+    }
+
+    @Test
+    fun orderBookHeatmapIsRecordedAndStreamed() {
+        onUi {
+            controller.onStart()
+            controller.onPageReady()
+        }
+        waitFor("heatmap") { find("heat", "set").isNotEmpty() }
+        val set = find("heat", "set").first()
+        assertEquals("spot", set.getString("market"))
+        assertEquals(100.0, set.getDouble("binSize"))
+        waitFor("live heat") { find("heat", "live").size >= 3 }
+        assertTrue(fake.requests.contains("/api/v3/depth"))
+        assertTrue(fake.requests.none { it == "/fapi/v1/depth" })
+
+        // Today's daily bar: $100 bins of the fake book, with walls at every $1000.
+        val live = find("heat", "live").last()
+        val today = Timeframe.D1.barStart(System.currentTimeMillis())
+        val bar = decodeHeat(Base64.getDecoder().decode(live.getString("data"))).single { it.time == today }
+        val mid = FakeExchanges.price(System.currentTimeMillis())
+        assertTrue(Math.abs(Math.floor(mid / 100).toInt() - bar.bidTop) <= 1, "top bid bin ${bar.bidTop} for mid $mid")
+        val inner = (2 until bar.bids.size - 2).map { j -> bar.bidTop - j to bar.bids[j] }
+        val walls = inner.filter { (bin, _) -> bin % 10 == 0 }
+        assertTrue(walls.isNotEmpty())
+        assertTrue(walls.minOf { it.second } > inner.filter { (bin, _) -> bin % 5 != 0 }.maxOf { it.second }, "walls stand out")
+        assertEquals(HeatBuilder.code(50.0), inner.first { (bin, _) -> bin % 5 != 0 }.second, "a \$100 bin holds 200 levels of 0.25 BTC")
+        waitFor("book status") { find("status").lastOrNull()?.getJSONObject("sources")?.optJSONObject("book")?.optString("state") == "ok" }
+
+        // What was recorded is on disk: a new chart (e.g. after a restart) shows it straight away.
+        onUi { controller.onStop() }
+        controller.awaitSaved()
+        val stored = HeatBuilder.load(BookStore.forDir(File(dataDir, "book")), BookMarket.SPOT, Timeframe.M1, System.currentTimeMillis())
+        assertTrue(decodeHeat(stored.encodeAll(System.currentTimeMillis())).isNotEmpty())
+
+        // Switching to the futures book records that one instead.
+        onUi {
+            controller.onStart()
+            controller.setSetting("heat.book", "futures")
+        }
+        waitFor("futures heatmap") { find("heat", "set").any { it.optString("market") == "futures" } }
+        waitFor("futures depth") { fake.requests.contains("/fapi/v1/depth") }
+
+        // Switched off: the page is told, and sampling stops.
+        onUi { controller.setSetting("heat", "off") }
+        waitFor("heat off") { find("heat", "off").isNotEmpty() }
+        Thread.sleep(400)
+        val requests = fake.requests.count { it.endsWith("/depth") }
+        Thread.sleep(1_000)
+        assertEquals(requests, fake.requests.count { it.endsWith("/depth") })
+    }
+
+    @Test
+    fun recordedOrderBookShowsAsHeatOnTheHourlyChart() {
+        // Three days recorded in the background (a snapshot every 15 minutes), before the app opens.
+        val now = System.currentTimeMillis()
+        val store = BookStore.forDir(File(dataDir, "book"))
+        var t = now - 3 * DAY
+        while (t < now - 20 * 60_000) {
+            store.append(BookMarket.SPOT, BookParsers.depth(FakeExchanges.depthJson(t, 5000, 0.5, futures = false), t))
+            t += 15 * 60_000
+        }
+        val gen = openOn("1h")
+        waitFor("heatmap") { find("heat", "set", gen).isNotEmpty() }
+        val set = find("heat", "set", gen).first()
+        assertEquals(20.0, set.getDouble("binSize"))
+        assertEquals((now - 3 * DAY) / 1000, set.getLong("since"))
+        val bars = decodeHeat(Base64.getDecoder().decode(set.getString("data")))
+        assertTrue(bars.size in 72..74, "bars ${bars.size}")
+        for (bar in bars.dropLast(1)) {
+            // Each hour: the fake book around that hour's price, 0.25 BTC per 50 cents -> 10 BTC per $20 bin.
+            val mid = FakeExchanges.price(bar.time + 30 * 60_000)
+            assertTrue(Math.abs(bar.bidTop * 20 - mid) < 700, "bar ${bar.time}: top bid ${bar.bidTop * 20}, price $mid")
+            val usual = bar.bids.drop(40).dropLast(40).groupingBy { it }.eachCount().maxBy { it.value }.key
+            assertEquals(HeatBuilder.code(10.0), usual)
+        }
+        waitFor("history loaded") { loaded(gen) }
+        waitFor("live heat") { find("heat", "live", gen).isNotEmpty() }
     }
 
     @Test

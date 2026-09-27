@@ -3,7 +3,9 @@
 An Android app (built for a Galaxy S21, runs on Android 8+) that draws the three-pane chart from
 the reference screenshot and keeps it updating live:
 
-1. **BTCUSDT, Binance-Futures** candles
+1. **BTCUSDT, Binance-Futures** candles, drawn over an **order book heatmap** in the style of
+   Material Indicators' FireCharts (sell orders in fire colours, buy orders in teal), with volume
+   bars and the visible high/low labelled
 2. **Aggregated Open Interest**: BTC perpetual OI, summed over Binance, Bybit, OKX and Hyperliquid
 3. **Cross Exchange Funding**: funding rate per exchange in % per 8 h, as step lines
 
@@ -53,6 +55,50 @@ How the panes are computed:
 - The first launch still downloads Binance's daily archive files for the 1D view once (about 170
   small files); they are kept afterwards.
 
+## The order book heatmap
+
+### Where the heatmap chart in the HODL15Capital post comes from
+
+The chart in the post (black background, a `SENSITIVITY` slider, asks in red/orange/yellow above
+the price, bids in teal below, "15d 2h ago … now" on the time axis) is **Material Indicators'
+FireCharts** (materialindicators.com). It is a heatmap of **Binance's BTC/USDT spot order book**:
+every horizontal line is limit orders resting at that price, brighter where more BTC sits. The
+"fake sell orders at $85,000" in the post are such a wall that was pulled before price got there.
+Material Indicators also run a FireCharts chatbot that posts a two-week BTC chart like this one
+into partner Telegram communities every 1, 2 or 4 hours. The evenly spaced "2h ago" labels on the
+time axis fit that.
+
+Who has the data: Binance publishes its order book live, for free (REST depth snapshots and
+WebSocket updates), but it keeps **no public order book history**. Its archive (data.binance.vision)
+has trades and candles, and for futures only depth summed in ±1–5 % bands. Material Indicators
+record the book around the clock on their own servers and sell that history (FireCharts, about
+three years for Binance BTC and USDT pairs). Other paid tools do the same (CoinGlass liquidity
+heatmap, Bookmap, TensorCharts, TapeSurf).
+
+### How the app builds it
+
+The app records Binance's book itself:
+
+- **While the app is open**: a depth snapshot every minute: spot `GET /api/v3/depth?limit=5000`
+  (5000 price levels a side, about 60 KB, weight 250), or futures `GET /fapi/v1/depth?limit=1000`
+  if you pick the futures book in ⓘ.
+- **While it is closed**: a JobScheduler job takes a snapshot about every 15 minutes (Android may
+  delay it when the phone sleeps deeply). ⓘ → *Record while closed* sets it to always, Wi-Fi only or
+  off. With the spot book that is about 6 MB a day.
+- Snapshots are summed into $10 price bins (up to 10 % from the price) and kept on the phone for
+  31 days, at about 2 bytes per bin.
+- Each bar shows the **average quantity** resting in each price band while the bar was open. A
+  snapshot counts until the next one, but for at most 30 minutes, so gaps in the recording stay
+  black. Bands are $10 (1m, 5m), $20 (15m–1h), $50 (4h), $100 (1D), $250 (1W) and $500 (1M).
+- **Sensitivity**: the slider's left handle hides quantities below it, the right handle is where
+  colours reach full strength. The range adapts to the timeframe's data (5th to 99.8th
+  percentile). Long-press a band to read its quantity.
+
+The heat builds up from the moment the app starts recording: older bars stay black. FireCharts
+shows years because Material Indicators have been recording since. A REST snapshot also only
+holds the 5000 price levels nearest the price. ⓘ shows the price range the latest snapshot
+covered, and walls further away than that are not seen.
+
 ### Differences from Velo's numbers
 
 - Velo does not publish exactly which markets its aggregate includes. This app sums the four
@@ -95,11 +141,14 @@ first (you only lose the app's cached history and settings).
   (`app/src/test/.../FakeExchanges.kt`). `LoadTimingTest` prints how fast the panes appear with a
   150 ms round trip per request, on a first launch and on a later one.
 - `tools/web-test/`: renders the chart page in headless Chromium with a fake Android bridge.
-  `run.js` exercises touch pan, pinch zoom and long-press, and saves screenshots. `replay.js`
-  replays a message transcript recorded by the end-to-end tests (`app/build/e2e/*.json`):
+  `run.js` exercises touch pan, pinch zoom and long-press, and saves screenshots. `heat.js` checks
+  the heatmap (colours, sensitivity slider, long-press readout, switching it off) with synthetic
+  order books. `replay.js` replays a message transcript recorded by the end-to-end tests
+  (`app/build/e2e/*.json`), which checks the heatmap's binary format end to end:
   ```sh
   NODE_PATH=$(npm root -g) node tools/web-test/run.js out/
-  NODE_PATH=$(npm root -g) node tools/web-test/replay.js app/build/e2e/dailyChartLoadsAllPanesAndGoesLive.json out/daily.png
+  NODE_PATH=$(npm root -g) node tools/web-test/heat.js out/
+  NODE_PATH=$(npm root -g) node tools/web-test/replay.js app/build/e2e/recordedOrderBookShowsAsHeatOnTheHourlyChart.json out/heat.png
   ```
 
 ## Layout
@@ -109,7 +158,9 @@ app/src/main/assets/chart/   chart page: index.html, app.js, TradingView Lightwe
 app/src/main/kotlin/.../
   MainActivity.kt            WebView host and JavaScript bridge
   ChartController.kt         loading, lazy history, live polling, messages to the page
-  data/                      history loaders per exchange, OI and funding aggregation
+  BookRecordJob.kt           background order book recording (JobScheduler)
+  data/                      history loaders per exchange, OI and funding aggregation,
+                             order book storage (BookStore) and heatmap building (Heatmap.kt)
   net/                       exchange API clients, Binance archive, price stream
   model/                     timeframes, bars, exchanges
 tools/                       toolchain setup, browser tests
@@ -117,4 +168,4 @@ tools/                       toolchain setup, browser tests
 
 Charts are drawn with [TradingView Lightweight Charts™](https://www.tradingview.com/lightweight-charts/)
 (Apache 2.0, © TradingView, Inc., https://www.tradingview.com/). This app is not affiliated with
-Velo, TradingView or any exchange.
+Velo, TradingView, Material Indicators or any exchange.

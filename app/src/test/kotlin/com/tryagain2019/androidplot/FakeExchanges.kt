@@ -53,7 +53,40 @@ class FakeExchanges(
         const val BYBIT_FUNDING = 0.00008
         const val OKX_FUNDING = 0.00009
         const val HL_FUNDING = 0.0000125
+
+        /** Resting quantity of the fake order books at [price]: a floor, with walls every $500 and $1000. */
+        fun bookQuantity(price: Double): Double = when {
+            Math.floorMod(Math.round(price * 100), 100_000L) == 0L -> 60.0
+            Math.floorMod(Math.round(price * 100), 50_000L) == 0L -> 25.0
+            else -> 0.25
+        }
         val ARCHIVE_START: LocalDate = LocalDate.of(2021, 12, 1)
+
+
+        /** The fake book at [now]: a level every [step] dollars around [price], best first, as Binance's depth endpoints send it. */
+        fun depthJson(now: Long, limit: Int, step: Double, futures: Boolean): String {
+            val mid = price(now)
+            val bestBid = Math.floor(mid / step) * step
+            val bestAsk = bestBid + step
+            val sb = StringBuilder(limit * 64)
+            sb.append("""{"lastUpdateId":${now / 10}""")
+            if (futures) sb.append(""","E":$now,"T":${now - 3}""")
+            sb.append(""","bids":[""")
+            for (i in 0 until limit) {
+                val p = bestBid - i * step
+                if (i > 0) sb.append(',')
+                sb.append("[\"").append(fmt(p)).append("\",\"").append(fmt(bookQuantity(p))).append("\"]")
+            }
+            sb.append("""],"asks":[""")
+            for (i in 0 until limit) {
+                val p = bestAsk + i * step
+                if (i > 0) sb.append(',')
+                sb.append("[\"").append(fmt(p)).append("\",\"").append(fmt(bookQuantity(p))).append("\"]")
+            }
+            return sb.append("]}").toString()
+        }
+
+        private fun fmt(v: Double) = String.format(java.util.Locale.US, "%.8f", v)
 
         private val intervals = mapOf(
             "1m" to MINUTE, "3m" to 3 * MINUTE, "5m" to 5 * MINUTE, "15m" to 15 * MINUTE, "30m" to 30 * MINUTE,
@@ -112,6 +145,8 @@ class FakeExchanges(
                 )
                 path == "/api/v5/public/funding-rate-history" -> json(okxFunding(ql("after"), q("limit")!!.toInt(), now))
                 path == "/info" -> hyperliquid(request.body.clone().readUtf8(), now)
+                path == "/api/v3/depth" -> json(depthJson(now, q("limit")!!.toInt().also { require(it <= 5000) }, 0.5, futures = false))
+                path == "/fapi/v1/depth" -> json(depthJson(now, q("limit")!!.toInt().also { require(it <= 1000) }, 0.2, futures = true))
                 path.startsWith("/ws/") -> stream(path.removePrefix("/ws/"))
                 else -> MockResponse().setResponseCode(404)
             }
@@ -122,7 +157,6 @@ class FakeExchanges(
 
     private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json").setBody(body)
 
-    private fun fmt(v: Double) = String.format(java.util.Locale.US, "%.8f", v)
 
     private fun ceilTo(t: Long, step: Long) = t - Math.floorMod(t, step) + step
 

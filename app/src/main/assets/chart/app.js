@@ -7,9 +7,11 @@
  * Message types (Kotlin -> JS), times are UTC seconds:
  *   init    {settings, version}
  *   reset   {gen, tf, symbol, venue}                    start of a (re)load for a timeframe
- *   price   {gen, mode: set|prepend|live, bars:[[t,o,h,l,c]...]}
+ *   price   {gen, mode: set|prepend|live, bars:[[t,o,h,l,c,volume]...]}
  *   oi      {gen, mode: set|live, bars:[[t,o,h,l,c]...]}
  *   funding {gen, mode: set|live, series:{hyperliquid:[[t,v]...], okx:..., binance:..., bybit:...}}
+ *   heat    {gen, mode: set|live|off, market, name, binSize, since, data}   order book heatmap; data is
+ *           base64 of bar records (see decodeHeat)
  *   busy    {gen, what: price|oi|funding, busy, detail}
  *   status  {live: ok|warn|error, sources:{key:{state, text}}}
  *   error   {gen, text}                                 shown as a banner with a retry button
@@ -28,6 +30,17 @@
     crosshair: '#80858f',
     crosshairLabel: '#3b3e46',
     zeroLine: '#7a7a7a',
+    volumeUp: 'rgba(34, 207, 144, 0.5)',
+    volumeDown: 'rgba(215, 47, 106, 0.5)',
+  };
+
+  // Order book heatmap in the style of Material Indicators' FireCharts: asks in fire colours,
+  // bids in teal, on black. Stops run from the faintest shown quantity to the strongest.
+  const HEAT = {
+    bg: '#0a0a0b',
+    asks: [[0, [40, 6, 8]], [0.22, [92, 12, 14]], [0.45, [168, 26, 20]], [0.65, [226, 84, 22]], [0.82, [252, 164, 38]], [1, [255, 236, 150]]],
+    bids: [[0, [4, 30, 28]], [0.22, [8, 66, 60]], [0.45, [14, 116, 100]], [0.65, [28, 172, 136]], [0.82, [84, 226, 174]], [1, [200, 255, 230]]],
+    gamma: 1.6, // > 1 keeps the everyday book dark so walls stand out
   };
 
   // Funding lines; drawn in this order (later ones on top).
@@ -63,6 +76,7 @@
   // ---------------------------------------------------------------- formatting
 
   const nfPrice = new Intl.NumberFormat('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  const nfInt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
 
   function fmtPrice(v) {
     return nfPrice.format(v);
@@ -84,6 +98,17 @@
     if (a >= 1e6) return trimZeros((v / 1e6).toFixed(3)) + 'M';
     if (a >= 1e3) return trimZeros((v / 1e3).toFixed(3)) + 'K';
     return v.toFixed(0);
+  }
+
+  function fmtVolume(v) {
+    const a = Math.abs(v);
+    if (a >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+    if (a >= 1e3) return (v / 1e3).toFixed(2) + 'K';
+    return v.toFixed(a >= 100 ? 0 : a >= 10 ? 1 : 2);
+  }
+
+  function fmtBtc(v) {
+    return v >= 100 ? nfInt.format(v) : v.toFixed(v >= 10 ? 1 : v >= 1 ? 2 : 3);
   }
 
   function fmtFunding(v) {
@@ -159,6 +184,15 @@
     priceFormat: { type: 'custom', minMove: 0.1, formatter: fmtPrice, tickmarksFormatter: ps => ps.map(fmtPrice) },
   }), 0);
 
+  // Volume bars along the bottom of the price pane, on their own hidden scale.
+  const volumeSeries = chart.addSeries(L.HistogramSeries, {
+    priceScaleId: 'volume',
+    priceFormat: { type: 'custom', minMove: 0.001, formatter: fmtVolume },
+    lastValueVisible: false,
+    priceLineVisible: false,
+  }, 0);
+  volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.9, bottom: 0 } });
+
   const oiFormat = { type: 'custom', minMove: 1, formatter: fmtOi, tickmarksFormatter: ps => ps.map(fmtOiTick) };
   const oiSeries = chart.addSeries(L.CandlestickSeries, Object.assign({}, candleStyle, {
     lastValueVisible: false,
@@ -224,7 +258,7 @@
   }
   applyPaneLayout();
   if (window.ResizeObserver) new ResizeObserver(applyPaneLayout).observe(chartEl);
-  chart.priceScale('right', 0).applyOptions({ scaleMargins: { top: 0.09, bottom: 0.05 } });
+  chart.priceScale('right', 0).applyOptions({ scaleMargins: { top: 0.09, bottom: 0.12 } });
   chart.priceScale('right', 1).applyOptions({ scaleMargins: { top: 0.2, bottom: 0.08 } });
   // Room at the top for the two-line funding legend.
   chart.priceScale('right', 2).applyOptions({ scaleMargins: { top: 0.3, bottom: 0.08 } });
@@ -242,14 +276,334 @@
     funding: {},
     busy: {},
     hover: null,
+    hoverPrice: null, // price under the crosshair in the price pane
     needInitialView: true,
     settings: {
       tz: 'local',
       oi: { binance: true, bybit: true, okx: true, hyperliquid: true },
       funding: { binance: true, bybit: true, okx: true, hyperliquid: true },
+      heat: { on: true, book: 'spot', bg: 'any', lo: 0, hi: 0.8 },
+    },
+    heat: {
+      market: 'spot',
+      name: '',
+      binSize: 10,
+      since: null, // first recorded snapshot (UTC seconds)
+      bars: new Map(), // display time -> record
+      version: 0,
+      cMin: 1, // quantity codes spanning the data (percentiles), which the sensitivity range maps onto
+      cMax: 255,
     },
     sources: {},
   };
+
+  // ---------------------------------------------------------------- order book heatmap
+
+  function heatOn() {
+    return state.settings.heat.on;
+  }
+
+  /**
+   * Heat data is a run of bar records (little endian): bar open time (u32, UTC seconds), top bid
+   * bin (i32), bid count (u16), bottom ask bin (i32), ask count (u16), then one quantity code per
+   * bin, bids from the top down and asks from the bottom up. Bin k spans [k, k + 1) * binSize; code
+   * c stands for an average of 10^((c - 1) / 24 - 4) BTC resting there while the bar was open.
+   */
+  function decodeHeat(b64, into) {
+    if (!b64) return;
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const dv = new DataView(bytes.buffer);
+    let p = 0;
+    while (p + 16 <= bytes.length) {
+      const bidCount = dv.getUint16(p + 8, true);
+      const askCount = dv.getUint16(p + 14, true);
+      const off = p + 16;
+      if (off + bidCount + askCount > bytes.length) break;
+      into.set(dv.getUint32(p, true) + state.shift, {
+        bidTop: dv.getInt32(p + 4, true),
+        bidCount,
+        askBottom: dv.getInt32(p + 10, true),
+        askCount,
+        bytes,
+        bidOff: off,
+        askOff: off + bidCount,
+      });
+      p = off + bidCount + askCount;
+    }
+  }
+
+  function heatQuantity(code) {
+    return code ? Math.pow(10, (code - 1) / 24 - 4) : 0;
+  }
+
+  /** Bid and ask codes of bin k in a bar record. */
+  function heatCodes(r, k) {
+    const bid = k <= r.bidTop && k > r.bidTop - r.bidCount ? r.bytes[r.bidOff + r.bidTop - k] : 0;
+    const ask = k >= r.askBottom && k < r.askBottom + r.askCount ? r.bytes[r.askOff + k - r.askBottom] : 0;
+    return { bid, ask };
+  }
+
+  // The sensitivity range spans the quantities the data actually holds (5th to 99.8th percentile),
+  // so colours mean the same while panning and adapt to the timeframe's bin size.
+  function updateHeatRange() {
+    const counts = new Uint32Array(256);
+    let total = 0;
+    for (const r of state.heat.bars.values()) {
+      const end = r.askOff + r.askCount;
+      for (let i = r.bidOff; i < end; i++) {
+        const c = r.bytes[i];
+        if (c) {
+          counts[c]++;
+          total++;
+        }
+      }
+    }
+    if (!total) {
+      state.heat.cMin = 1;
+      state.heat.cMax = 255;
+      return;
+    }
+    const percentile = q => {
+      let acc = 0;
+      for (let c = 1; c < 256; c++) {
+        acc += counts[c];
+        if (acc >= q * total) return c;
+      }
+      return 255;
+    };
+    state.heat.cMin = percentile(0.05);
+    state.heat.cMax = Math.max(state.heat.cMin + 4, percentile(0.998));
+  }
+
+  function stopColor(stops, t) {
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const [t0, c0] = stops[i - 1];
+        const [t1, c1] = stops[i];
+        const f = t1 > t0 ? (t - t0) / (t1 - t0) : 1;
+        return [0, 1, 2].map(k => Math.round(c0[k] + (c1[k] - c0[k]) * f));
+      }
+    }
+    return stops[stops.length - 1][1];
+  }
+
+  // Colour per quantity code and side, as little-endian RGBA words for ImageData.
+  const palette = { key: '', asks: new Uint32Array(256), bids: new Uint32Array(256) };
+  function heatPalette() {
+    const h = state.heat;
+    const s = state.settings.heat;
+    const key = `${h.cMin}/${h.cMax}/${s.lo}/${s.hi}`;
+    if (palette.key === key) return palette;
+    palette.key = key;
+    const lo = h.cMin + s.lo * (h.cMax - h.cMin);
+    const hi = Math.max(lo + 0.5, h.cMin + s.hi * (h.cMax - h.cMin));
+    for (let c = 0; c < 256; c++) {
+      if (c === 0 || c < lo) {
+        palette.asks[c] = 0;
+        palette.bids[c] = 0;
+        continue;
+      }
+      const t = Math.pow(Math.min(1, (c - lo) / (hi - lo)), HEAT.gamma);
+      for (const side of ['asks', 'bids']) {
+        const [r, g, b] = stopColor(HEAT[side], t);
+        palette[side][c] = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return palette;
+  }
+
+  // The visible part of the heatmap is rendered at one pixel per (bar, price row) into an
+  // offscreen canvas, which the pane then scales up with a single drawImage.
+  const heatCanvas = document.createElement('canvas');
+  const heatCtx = heatCanvas.getContext('2d');
+  let heatImage = null;
+  let heatKey = '';
+  let heatBids = new Uint8Array(0);
+  let heatAsks = new Uint8Array(0);
+
+  function heatLayout(mediaHeight) {
+    const n = state.price.length;
+    if (!state.heat.bars.size || !n) return null;
+    const ts = chart.timeScale();
+    const range = ts.getVisibleLogicalRange();
+    if (!range) return null;
+    const i0 = Math.max(0, Math.floor(range.from));
+    const i1 = Math.min(n - 1, Math.ceil(range.to));
+    if (i1 < i0) return null;
+    const x0 = ts.logicalToCoordinate(i0);
+    const x1 = ts.logicalToCoordinate(i1);
+    if (x0 === null || x1 === null) return null;
+    const spacing = i1 > i0 ? (x1 - x0) / (i1 - i0) : ts.options().barSpacing;
+    const pTop = priceSeries.coordinateToPrice(0);
+    const pBottom = priceSeries.coordinateToPrice(mediaHeight);
+    if (pTop === null || pBottom === null || !(pTop > pBottom) || !(spacing > 0)) return null;
+    const bin = state.heat.binSize;
+    const g = Math.max(1, Math.ceil((pTop - pBottom) / mediaHeight / bin)); // bins per row, rows >= 1px
+    const rowSize = g * bin;
+    const rTop = Math.floor(pTop / rowSize);
+    const rows = rTop - Math.floor(pBottom / rowSize) + 1;
+    const gx = Math.max(1, Math.ceil(1 / spacing)); // bars per column, columns >= 1px
+    const cols = Math.floor((i1 - i0) / gx) + 1;
+    return { i0, i1, x0, spacing, g, rowSize, rTop, rows, gx, cols };
+  }
+
+  function renderHeat(lay) {
+    const pal = heatPalette();
+    const key = [lay.i0, lay.i1, lay.gx, lay.g, lay.rTop, lay.rows, state.heat.version, pal.key, state.gen].join(',');
+    if (key === heatKey) return;
+    heatKey = key;
+    const { i0, i1, gx, g, rTop, rows, cols } = lay;
+    const cells = cols * rows;
+    if (heatBids.length < cells) {
+      heatBids = new Uint8Array(cells);
+      heatAsks = new Uint8Array(cells);
+    } else {
+      heatBids.fill(0, 0, cells);
+      heatAsks.fill(0, 0, cells);
+    }
+    const bars = state.heat.bars;
+    for (let i = i0; i <= i1; i++) {
+      const r = bars.get(state.price[i].time);
+      if (!r) continue;
+      const col = Math.floor((i - i0) / gx);
+      const b = r.bytes;
+      for (let j = 0; j < r.bidCount; j++) { // bins going down the price axis
+        const code = b[r.bidOff + j];
+        if (!code) continue;
+        const row = rTop - Math.floor((r.bidTop - j) / g);
+        if (row < 0) continue;
+        if (row >= rows) break;
+        const idx = row * cols + col;
+        if (code > heatBids[idx]) heatBids[idx] = code;
+      }
+      for (let j = 0; j < r.askCount; j++) { // bins going up
+        const code = b[r.askOff + j];
+        if (!code) continue;
+        const row = rTop - Math.floor((r.askBottom + j) / g);
+        if (row >= rows) continue;
+        if (row < 0) break;
+        const idx = row * cols + col;
+        if (code > heatAsks[idx]) heatAsks[idx] = code;
+      }
+    }
+    if (heatCanvas.width !== cols || heatCanvas.height !== rows) {
+      heatCanvas.width = cols;
+      heatCanvas.height = rows;
+      heatImage = null;
+    }
+    if (!heatImage) heatImage = heatCtx.createImageData(cols, rows);
+    const px = new Uint32Array(heatImage.data.buffer);
+    for (let idx = 0; idx < cells; idx++) {
+      const a = heatAsks[idx];
+      const bd = heatBids[idx];
+      px[idx] = a >= bd ? pal.asks[a] : pal.bids[bd]; // the bigger side wins where price crossed
+    }
+    heatCtx.putImageData(heatImage, 0, 0);
+  }
+
+  let requestChartUpdate = () => {};
+
+  const heatPrimitive = {
+    attached(param) {
+      requestChartUpdate = param.requestUpdate;
+    },
+    paneViews() {
+      return heatPaneViews;
+    },
+    priceAxisPaneViews() {
+      return heatAxisViews;
+    },
+  };
+  const heatPaneViews = [{
+    zOrder: () => 'bottom',
+    renderer: () => ({
+      draw(target) {
+        if (!heatOn()) return;
+        target.useBitmapCoordinateSpace(scope => {
+          const ctx = scope.context;
+          ctx.fillStyle = HEAT.bg;
+          ctx.fillRect(0, 0, scope.bitmapSize.width, scope.bitmapSize.height);
+          const lay = heatLayout(scope.bitmapSize.height / scope.verticalPixelRatio);
+          if (!lay) return;
+          const yTop = priceSeries.priceToCoordinate((lay.rTop + 1) * lay.rowSize);
+          const yBottom = priceSeries.priceToCoordinate((lay.rTop - lay.rows + 1) * lay.rowSize);
+          if (yTop === null || yBottom === null) return;
+          renderHeat(lay);
+          const hr = scope.horizontalPixelRatio;
+          const vr = scope.verticalPixelRatio;
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(heatCanvas, 0, 0, lay.cols, lay.rows,
+            (lay.x0 - lay.spacing / 2) * hr, yTop * vr, lay.cols * lay.gx * lay.spacing * hr, (yBottom - yTop) * vr);
+        });
+      },
+    }),
+  }];
+  // The price axis beside the heatmap goes black as well (its border line stays).
+  const heatAxisViews = [{
+    zOrder: () => 'bottom',
+    renderer: () => ({
+      draw(target) {
+        if (!heatOn()) return;
+        target.useBitmapCoordinateSpace(scope => {
+          const border = Math.max(1, Math.floor(scope.horizontalPixelRatio));
+          scope.context.fillStyle = HEAT.bg;
+          scope.context.fillRect(border, 0, scope.bitmapSize.width - border, scope.bitmapSize.height);
+        });
+      },
+    }),
+  }];
+  priceSeries.attachPrimitive(heatPrimitive);
+
+  // Highest high and lowest low of the visible bars, labelled like FireCharts does.
+  function drawExtremeLabel(ctx, size, index, price, above) {
+    const x = chart.timeScale().logicalToCoordinate(index);
+    const y = priceSeries.priceToCoordinate(price);
+    if (x === null || y === null || y < 0 || y > size.height) return;
+    const text = nfInt.format(price);
+    const w = Math.ceil(ctx.measureText(text).width) + 8;
+    const h = 15;
+    const cx = Math.min(size.width - w / 2 - 2, Math.max(w / 2 + 2, x));
+    let top = above ? y - 5 - h : y + 5;
+    if (top < 1) top = y + 5;
+    if (top + h > size.height - 1) top = y - 5 - h;
+    if (top < 1) return;
+    ctx.fillStyle = 'rgba(46, 48, 54, 0.92)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx - w / 2, top, w, h, 2); else ctx.rect(cx - w / 2, top, w, h);
+    ctx.fill();
+    ctx.fillStyle = '#d9dbe0';
+    ctx.fillText(text, cx, top + h / 2 + 0.5);
+  }
+
+  const extremesViews = [{
+    zOrder: () => 'top',
+    renderer: () => ({
+      draw(target) {
+        const n = state.price.length;
+        const range = chart.timeScale().getVisibleLogicalRange();
+        if (!n || !range) return;
+        const i0 = Math.max(0, Math.ceil(range.from));
+        const i1 = Math.min(n - 1, Math.floor(range.to));
+        if (i1 - i0 < 2) return;
+        let hi = i0;
+        let lo = i0;
+        for (let i = i0 + 1; i <= i1; i++) {
+          if (state.price[i].high > state.price[hi].high) hi = i;
+          if (state.price[i].low < state.price[lo].low) lo = i;
+        }
+        target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+          ctx.font = '10px Roboto, -apple-system, "Segoe UI", sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          drawExtremeLabel(ctx, mediaSize, hi, state.price[hi].high, true);
+          drawExtremeLabel(ctx, mediaSize, lo, state.price[lo].low, false);
+        });
+      },
+    }),
+  }];
+  priceSeries.attachPrimitive({ paneViews: () => extremesViews });
 
   // ---------------------------------------------------------------- legends
 
@@ -258,6 +612,70 @@
     el.className = 'legend';
     return el;
   });
+
+  // Sensitivity of the heatmap: the left handle hides quantities below it, the right one is where
+  // colours reach full strength.
+  const heatCtl = document.createElement('div');
+  heatCtl.className = 'heat-ctl';
+  heatCtl.innerHTML = '<span class="heat-lbl">SENSITIVITY</span><div class="heat-track"><div class="heat-grad"></div>' +
+    '<div class="heat-dim lo"></div><div class="heat-dim hi"></div><div class="heat-h lo"></div><div class="heat-h hi"></div></div>';
+  const heatTrack = heatCtl.querySelector('.heat-track');
+
+  // The price pane's legend and the slider stack in one box.
+  const priceBox = document.createElement('div');
+  priceBox.className = 'pane-box';
+  priceBox.appendChild(legends[0]);
+  priceBox.appendChild(heatCtl);
+
+  function renderSlider() {
+    const { lo, hi } = state.settings.heat;
+    heatCtl.style.display = heatOn() ? '' : 'none';
+    heatCtl.querySelector('.heat-h.lo').style.left = lo * 100 + '%';
+    heatCtl.querySelector('.heat-h.hi').style.left = hi * 100 + '%';
+    heatCtl.querySelector('.heat-dim.lo').style.width = lo * 100 + '%';
+    heatCtl.querySelector('.heat-dim.hi').style.left = hi * 100 + '%';
+  }
+
+  let dragging = null;
+  function sliderValue(e) {
+    const r = heatTrack.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  }
+  function moveSlider(v) {
+    const s = state.settings.heat;
+    if (dragging === 'lo') s.lo = Math.max(0, Math.min(v, s.hi - 0.05));
+    else s.hi = Math.min(1, Math.max(v, s.lo + 0.05));
+    renderSlider();
+    requestChartUpdate();
+  }
+  heatCtl.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    const v = sliderValue(e);
+    const { lo, hi } = state.settings.heat;
+    dragging = v < lo || (v <= hi && v - lo < hi - v) ? 'lo' : 'hi';
+    try {
+      heatCtl.setPointerCapture(e.pointerId);
+    } catch (err) { /* synthetic events in tests */ }
+    moveSlider(v);
+  });
+  heatCtl.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    e.preventDefault();
+    moveSlider(sliderValue(e));
+  });
+  function endDrag() {
+    if (!dragging) return;
+    dragging = null;
+    call('setSetting', 'heat.lo', state.settings.heat.lo.toFixed(3));
+    call('setSetting', 'heat.hi', state.settings.heat.hi.toFixed(3));
+  }
+  heatCtl.addEventListener('pointerup', endDrag);
+  heatCtl.addEventListener('pointercancel', endDrag);
+  // Keep the chart from panning underneath.
+  for (const type of ['touchstart', 'touchmove', 'mousedown', 'mousemove', 'wheel']) {
+    heatCtl.addEventListener(type, e => e.stopPropagation(), { passive: true });
+  }
 
   function paneCell(index) {
     const pane = chart.panes()[index];
@@ -271,7 +689,7 @@
   }
 
   function placeLegends() {
-    legends.forEach((el, i) => {
+    [priceBox, legends[1], legends[2]].forEach((el, i) => {
       const cell = paneCell(i);
       if (cell && el.parentElement !== cell) cell.appendChild(el);
     });
@@ -314,7 +732,9 @@
     let line2 = '';
     if (idx >= 0 && state.price[idx]) {
       const bar = state.price[idx];
-      if (hovering) line2 = ohlcHtml(bar, fmtPrice);
+      if (hovering) {
+        line2 = ohlcHtml(bar, fmtPrice) + (bar.volume ? `<span class="k">Vol</span><span>${fmtVolume(bar.volume)}</span>` : '') + bookHtml(bar.time);
+      }
       const prev = idx > 0 ? state.price[idx - 1] : null;
       if (prev) {
         const ch = bar.close - prev.close;
@@ -322,6 +742,7 @@
         line1 += `<span class="v">${signed(ch, fmtPrice)} (${signed(pct, v => v.toFixed(2))}%)</span>`;
       }
     }
+    if (!hovering) line2 = heatNote();
     legends[0].innerHTML = legendHtml(line1 + busyText('price'), line2);
 
     // open interest
@@ -341,14 +762,44 @@
     legends[2].innerHTML = legendHtml('<span class="title">Cross Exchange Funding</span>' + busyText('funding'), line2);
   }
 
+  // Liquidity under the crosshair: the average resting in that price bin while the bar was open.
+  function bookHtml(time) {
+    if (!heatOn() || state.hoverPrice === null) return '';
+    const r = state.heat.bars.get(time);
+    if (!r) return '';
+    const bin = state.heat.binSize;
+    const k = Math.floor(state.hoverPrice / bin);
+    const { bid, ask } = heatCodes(r, k);
+    if (!bid && !ask) return '';
+    const isAsk = ask >= bid;
+    const q = heatQuantity(isAsk ? ask : bid);
+    return `<br><span class="k0">${isAsk ? 'Asks' : 'Bids'}</span> <span style="color:${isAsk ? '#ff8f45' : '#3fe0b0'}">${fmtBtc(q)} BTC</span>` +
+      `<span class="muted"> at ${nfInt.format(k * bin)}–${nfInt.format((k + 1) * bin)}</span>`;
+  }
+
+  const fmtSince = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+  // While the recording is young, say where the heatmap starts (or why nothing is recorded).
+  function heatNote() {
+    if (!heatOn()) return '';
+    const book = state.sources.book;
+    if (book && book.state === 'error') return `<span class="muted">Order book: ${esc(book.text)}</span>`;
+    const since = state.heat.since;
+    if (since === null) return '<span class="muted">Order book heatmap: recording…</span>';
+    if (Date.now() / 1000 - since > 7 * 86400) return '';
+    return `<span class="muted">Order book recorded since ${esc(fmtSince.format(new Date(since * 1000)))}</span>`;
+  }
+
   function legendHtml(line1, line2) {
     return `<div>${line1}</div>` + (line2 ? `<div class="l2">${line2}</div>` : '');
   }
 
   chart.subscribeCrosshairMove(param => {
     const hover = param && param.point && param.time !== undefined ? param.time : null;
-    if (hover !== state.hover) {
+    const hoverPrice = hover !== null && param.paneIndex === 0 ? priceSeries.coordinateToPrice(param.point.y) : null;
+    if (hover !== state.hover || hoverPrice !== state.hoverPrice) {
       state.hover = hover;
+      state.hoverPrice = hoverPrice;
       updateLegends();
     }
   });
@@ -478,6 +929,8 @@
       }));
     }
 
+    renderHeatSettings();
+
     for (const b of document.querySelectorAll('#tz-seg button')) {
       b.classList.toggle('on', b.dataset.tz === state.settings.tz);
       b.onclick = () => {
@@ -489,6 +942,63 @@
     }
   }
 
+  function segRow(label, options, value, onChange) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span>${esc(label)}</span>`;
+    const seg = document.createElement('span');
+    seg.className = 'seg';
+    for (const [v, text] of options) {
+      const b = document.createElement('button');
+      b.textContent = text;
+      b.classList.toggle('on', v === value);
+      b.addEventListener('click', () => {
+        if (v !== value) onChange(v);
+      });
+      seg.appendChild(b);
+    }
+    row.appendChild(seg);
+    return row;
+  }
+
+  function renderHeatSettings() {
+    const heat = state.settings.heat;
+    const box = document.getElementById('heat-settings');
+    box.innerHTML = '';
+    const toggle = toggleRow('Show in the price pane', 'linear-gradient(90deg, #b01d14, #ffb020 50%, #1cae88)', heat.on, on => {
+      heat.on = on;
+      if (!on) state.heat.bars = new Map();
+      state.heat.version++;
+      applyHeatVisibility();
+      call('setSetting', 'heat', on ? 'on' : 'off');
+      renderHeatSettings();
+    });
+    box.appendChild(toggle);
+    if (!heat.on) return;
+    box.appendChild(segRow('Order book', [['spot', 'Spot'], ['futures', 'Futures']], heat.book, v => {
+      heat.book = v;
+      state.heat.bars = new Map();
+      state.heat.since = null;
+      state.heat.version++;
+      applyHeatVisibility();
+      call('setSetting', 'heat.book', v);
+      renderHeatSettings();
+    }));
+    box.appendChild(segRow('Record while closed', [['off', 'Off'], ['wifi', 'Wi-Fi'], ['any', 'Always']], heat.bg, v => {
+      heat.bg = v;
+      call('setSetting', 'heat.bg', v);
+      renderHeatSettings();
+    }));
+    const since = state.heat.since;
+    const note = document.createElement('p');
+    note.className = 'small';
+    note.textContent = (since ? `Recorded since ${fmtSince.format(new Date(since * 1000))}. ` : 'Nothing recorded yet. ') +
+      (heat.book === 'spot'
+        ? 'A spot snapshot (5000 price levels a side) is about 60 KB: roughly 4 MB an hour while the app is open, 6 MB a day while closed.'
+        : 'A futures snapshot (1000 price levels a side) is about 8 KB: under 1 MB a day while closed.');
+    box.appendChild(note);
+  }
+
   function applyFundingVisibility() {
     for (const ex of EXCHANGES) ex.series.applyOptions({ visible: !!state.settings.funding[ex.key] });
     updateLegends();
@@ -497,7 +1007,12 @@
   // ---------------------------------------------------------------- data handling
 
   function toCandle(b) {
-    return { time: b[0] + state.shift, open: b[1], high: b[2], low: b[3], close: b[4] };
+    return { time: b[0] + state.shift, open: b[1], high: b[2], low: b[3], close: b[4], volume: b[5] || 0 };
+  }
+
+  function toVolume(c) {
+    if (!c.volume) return { time: c.time }; // no bar (not even a hairline) without volume
+    return { time: c.time, value: c.volume, color: c.close >= c.open ? COLORS.volumeUp : COLORS.volumeDown };
   }
 
   function liveUpdate(arr, series, item) {
@@ -531,8 +1046,12 @@
     state.funding = {};
     state.busy = {};
     state.hover = null;
+    state.hoverPrice = null;
     state.needInitialView = true;
+    state.heat.bars = new Map();
+    state.heat.version++;
     priceSeries.setData([]);
+    volumeSeries.setData([]);
     oiSeries.setData([]);
     oiLabelSeries.setData([]);
     for (const ex of EXCHANGES) ex.series.setData([]);
@@ -548,14 +1067,18 @@
     if (msg.mode === 'set') {
       state.price = bars;
       priceSeries.setData(bars);
+      volumeSeries.setData(bars.map(toVolume));
     } else if (msg.mode === 'prepend') {
       const first = state.price.length ? state.price[0].time : Infinity;
       const older = bars.filter(b => b.time < first);
       if (!older.length) return;
       state.price = older.concat(state.price);
       priceSeries.setData(state.price);
+      volumeSeries.setData(state.price.map(toVolume));
     } else {
-      for (const b of bars) liveUpdate(state.price, priceSeries, b);
+      for (const b of bars) {
+        if (liveUpdate(state.price, priceSeries, b)) volumeSeries.update(toVolume(b));
+      }
     }
     if (state.needInitialView && state.price.length) {
       state.needInitialView = false;
@@ -601,10 +1124,39 @@
     updateLegends();
   }
 
+  function onHeat(msg) {
+    const h = state.heat;
+    if (msg.mode === 'off') {
+      state.settings.heat.on = false;
+      h.bars = new Map();
+    } else {
+      state.settings.heat.on = true;
+      if (msg.mode === 'set') {
+        h.bars = new Map();
+        h.market = msg.market || h.market;
+        h.name = msg.name || h.name;
+        h.binSize = msg.binSize || h.binSize;
+      }
+      if (msg.since !== undefined) h.since = msg.since;
+      decodeHeat(msg.data, h.bars);
+      updateHeatRange();
+    }
+    h.version++;
+    applyHeatVisibility();
+  }
+
+  function applyHeatVisibility() {
+    renderSlider();
+    requestChartUpdate();
+    updateLegends();
+  }
+
   function onStatus(msg) {
     const dot = document.getElementById('status-dot');
     dot.className = msg.live === 'ok' ? 'ok' : msg.live === 'error' ? 'error' : msg.live === 'warn' ? 'warn' : '';
+    const bookBefore = JSON.stringify(state.sources.book || null);
     if (msg.sources) state.sources = msg.sources;
+    if (JSON.stringify(state.sources.book || null) !== bookBefore) updateLegends();
     if (sheet.classList.contains('open')) renderSheet();
   }
 
@@ -614,7 +1166,20 @@
       if (s.tz) state.settings.tz = s.tz;
       if (s.oi) Object.assign(state.settings.oi, s.oi);
       if (s.funding) Object.assign(state.settings.funding, s.funding);
+      if (s.heat) {
+        const heat = state.settings.heat;
+        heat.on = s.heat.on !== false;
+        heat.book = s.heat.book || heat.book;
+        heat.bg = s.heat.bg || heat.bg;
+        const lo = parseFloat(s.heat.lo);
+        const hi = parseFloat(s.heat.hi);
+        if (lo >= 0 && hi <= 1 && lo < hi) {
+          heat.lo = lo;
+          heat.hi = hi;
+        }
+      }
       applyFundingVisibility();
+      applyHeatVisibility();
     }
     if (msg.version) document.getElementById('version').textContent = 'Version ' + msg.version;
     if (msg.tf) selectTimeframe(msg.tf);
@@ -629,6 +1194,7 @@
         case 'price': if (msg.gen === state.gen) onPrice(msg); break;
         case 'oi': if (msg.gen === state.gen) onOi(msg); break;
         case 'funding': if (msg.gen === state.gen) onFunding(msg); break;
+        case 'heat': if (msg.gen === state.gen) onHeat(msg); break;
         case 'busy':
           if (msg.gen !== state.gen) break;
           if (msg.busy) state.busy[msg.what] = { detail: msg.detail }; else delete state.busy[msg.what];
@@ -673,6 +1239,7 @@
   window.chartApp = { receive, back, chart, state };
   selectTimeframe(state.tf.code);
   placeLegends();
+  renderSlider();
   updateLegends();
   requestAnimationFrame(() => {
     placeLegends();

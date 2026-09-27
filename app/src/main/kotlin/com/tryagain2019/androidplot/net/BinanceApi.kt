@@ -61,7 +61,7 @@ object BinanceParsers {
         val out = ArrayList<Candle>(arr.length())
         arr.forEachArray { k ->
             val t = k.long(0) ?: return@forEachArray
-            val c = Candle(t, k.num(1), k.num(2), k.num(3), k.num(4))
+            val c = Candle(t, k.num(1), k.num(2), k.num(3), k.num(4), k.num(5).takeIf { it.isFinite() } ?: 0.0)
             if (c.open.isFinite() && c.high.isFinite() && c.low.isFinite() && c.close.isFinite()) out += c
         }
         return out.sortedBy { it.time }
@@ -111,7 +111,7 @@ object BinanceParsers {
         val data = root.optJSONObject("data") ?: root
         val k = data.optJSONObject("k") ?: return null
         val t = k.long("t") ?: return null
-        val c = Candle(t, k.num("o"), k.num("h"), k.num("l"), k.num("c"))
+        val c = Candle(t, k.num("o"), k.num("h"), k.num("l"), k.num("c"), k.num("v").takeIf { it.isFinite() } ?: 0.0)
         return if (c.open.isFinite() && c.close.isFinite() && c.high.isFinite() && c.low.isFinite()) c else null
     }
 }

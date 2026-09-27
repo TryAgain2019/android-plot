@@ -16,7 +16,7 @@ class StoredSeries(val points: NavigableMap<Long, Double>, val spans: Map<String
  * call from a background thread.
  */
 class HistoryStore(private val dir: File) {
-    fun readSeries(name: String): StoredSeries? = read(name) { input ->
+    fun readSeries(name: String): StoredSeries? = read(name, SERIES_VERSION) { input ->
         val spans = HashMap<String, Span>()
         repeat(input.readInt()) { spans[input.readUTF()] = Span(input.readLong(), input.readLong()) }
         val points = TreeMap<Long, Double>()
@@ -24,7 +24,7 @@ class HistoryStore(private val dir: File) {
         StoredSeries(points, spans)
     }
 
-    fun writeSeries(name: String, series: StoredSeries) = write(name) { out ->
+    fun writeSeries(name: String, series: StoredSeries) = write(name, SERIES_VERSION) { out ->
         out.writeInt(series.spans.size)
         for ((key, span) in series.spans) {
             out.writeUTF(key)
@@ -38,11 +38,13 @@ class HistoryStore(private val dir: File) {
         }
     }
 
-    fun readCandles(name: String): List<Candle>? = read(name) { input ->
-        List(input.readInt()) { Candle(input.readLong(), input.readDouble(), input.readDouble(), input.readDouble(), input.readDouble()) }
+    fun readCandles(name: String): List<Candle>? = read(name, CANDLES_VERSION) { input ->
+        List(input.readInt()) {
+            Candle(input.readLong(), input.readDouble(), input.readDouble(), input.readDouble(), input.readDouble(), input.readDouble())
+        }
     }
 
-    fun writeCandles(name: String, candles: List<Candle>) = write(name) { out ->
+    fun writeCandles(name: String, candles: List<Candle>) = write(name, CANDLES_VERSION) { out ->
         out.writeInt(candles.size)
         for (c in candles) {
             out.writeLong(c.time)
@@ -50,29 +52,30 @@ class HistoryStore(private val dir: File) {
             out.writeDouble(c.high)
             out.writeDouble(c.low)
             out.writeDouble(c.close)
+            out.writeDouble(c.volume)
         }
     }
 
     private fun file(name: String) = File(dir, "$name.bin")
 
-    private fun <T> read(name: String, body: (DataInputStream) -> T): T? {
+    private fun <T> read(name: String, version: Int, body: (DataInputStream) -> T): T? {
         val f = file(name)
         if (!f.isFile) return null
         return runCatching {
             DataInputStream(f.inputStream().buffered(64 * 1024)).use { input ->
-                if (input.readInt() != MAGIC || input.readInt() != VERSION) return null
+                if (input.readInt() != MAGIC || input.readInt() != version) return null
                 body(input)
             }
         }.getOrNull()
     }
 
-    private fun write(name: String, body: (DataOutputStream) -> Unit) {
+    private fun write(name: String, version: Int, body: (DataOutputStream) -> Unit) {
         runCatching {
             dir.mkdirs()
             val tmp = File(dir, "$name.tmp")
             DataOutputStream(tmp.outputStream().buffered(64 * 1024)).use { out ->
                 out.writeInt(MAGIC)
-                out.writeInt(VERSION)
+                out.writeInt(version)
                 body(out)
             }
             if (!tmp.renameTo(file(name))) tmp.delete()
@@ -81,6 +84,9 @@ class HistoryStore(private val dir: File) {
 
     private companion object {
         const val MAGIC = 0x42504c54 // "BPLT"
-        const val VERSION = 1
+        const val SERIES_VERSION = 1
+
+        /** 2: candles carry volume. Files written by older versions are ignored and downloaded again. */
+        const val CANDLES_VERSION = 2
     }
 }

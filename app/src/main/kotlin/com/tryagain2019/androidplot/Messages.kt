@@ -35,7 +35,8 @@ internal class Json {
 
     fun raw(name: String, json: String) = key(name).also { sb.append(json); needComma = true }
 
-    fun candles(name: String, bars: List<Candle>, decimals: Int) = key(name).also {
+    /** `[[t,o,h,l,c],...]`, or `[[t,o,h,l,c,v],...]` with [volumeDecimals]. */
+    fun candles(name: String, bars: List<Candle>, decimals: Int, volumeDecimals: Int? = null) = key(name).also {
         sb.append('[')
         bars.forEachIndexed { i, b ->
             if (i > 0) sb.append(',')
@@ -43,7 +44,12 @@ internal class Json {
             appendNumber(b.open, decimals); sb.append(',')
             appendNumber(b.high, decimals); sb.append(',')
             appendNumber(b.low, decimals); sb.append(',')
-            appendNumber(b.close, decimals); sb.append(']')
+            appendNumber(b.close, decimals)
+            if (volumeDecimals != null) {
+                sb.append(',')
+                appendNumber(b.volume, volumeDecimals)
+            }
+            sb.append(']')
         }
         sb.append(']')
         needComma = true

@@ -3,6 +3,7 @@ package com.tryagain2019.androidplot
 import com.tryagain2019.androidplot.model.Timeframe
 import com.tryagain2019.androidplot.net.BinanceApi
 import com.tryagain2019.androidplot.net.BinanceArchive
+import com.tryagain2019.androidplot.net.BookApi
 import com.tryagain2019.androidplot.net.BybitApi
 import com.tryagain2019.androidplot.net.HyperliquidApi
 import com.tryagain2019.androidplot.net.OkxApi
@@ -66,6 +67,7 @@ class LoadTimingTest {
             okx = OkxApi(client, base),
             hyperliquid = HyperliquidApi(client, base),
             archive = BinanceArchive(client, File(dataDir, "binance-archive"), base),
+            book = BookApi(client, spotBases = listOf(base), futuresBase = base),
             socketBases = listOf(base.replaceFirst("http", "ws") + "/ws/"),
         )
     }

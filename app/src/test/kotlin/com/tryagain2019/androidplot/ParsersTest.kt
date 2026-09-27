@@ -26,6 +26,7 @@ class ParsersTest {
         assertEquals(1758412800000, bars[0].time) // sorted ascending
         assertEquals(84705.4, bars[1].close)
         assertEquals(87012.0, bars[1].high)
+        assertEquals(151234.5, bars[1].volume)
     }
 
     @Test
@@ -63,6 +64,7 @@ class ParsersTest {
         val c = BinanceParsers.wsKline(raw)!!
         assertEquals(1638747660000, c.time)
         assertEquals(0.0025, c.high)
+        assertEquals(1000.0, c.volume)
         val combined = """{"stream":"btcusdt@kline_1m","data":$raw}"""
         assertEquals(c, BinanceParsers.wsKline(combined))
         assertNull(BinanceParsers.wsKline("""{"result":null,"id":1}"""))

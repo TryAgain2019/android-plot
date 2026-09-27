@@ -1,12 +1,13 @@
 package com.tryagain2019.androidplot.model
 
-/** OHLC bar; [time] is the bar's open time in epoch milliseconds (UTC). */
+/** OHLC bar; [time] is the bar's open time in epoch milliseconds (UTC). [volume] is in BTC (0 when unknown). */
 data class Candle(
     val time: Long,
     val open: Double,
     val high: Double,
     val low: Double,
     val close: Double,
+    val volume: Double = 0.0,
 )
 
 /** A point-in-time value, e.g. an open-interest snapshot in BTC. */

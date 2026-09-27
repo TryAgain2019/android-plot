@@ -17,6 +17,9 @@ import java.util.concurrent.TimeUnit
 class HttpException(val code: Int, val detail: String, val url: String) : IOException("HTTP $code${if (detail.isNotEmpty()) ": $detail" else ""}")
 
 object Http {
+    /** One client (connection pool, threads) for the whole process: the chart and the background job. */
+    val shared: OkHttpClient by lazy { newClient() }
+
     fun newClient(): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
