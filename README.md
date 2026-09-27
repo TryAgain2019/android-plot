@@ -93,11 +93,16 @@ The app records Binance's book itself:
 - **Sensitivity**: the slider's left handle hides quantities below it, the right handle is where
   colours reach full strength. The range adapts to the timeframe's data (5th to 99.8th
   percentile). Long-press a band to read its quantity.
+- **Bars with heat** (ⓘ, default 100; 50 to 1000): heat is drawn on the newest N bars. Recorded
+  bars show what was recorded. Bars among them from before the recording started show the
+  **current** book instead, dimmed, so today's walls are visible across the chart from the first
+  minute. The legend says so ("dimmed: current book"), and long-press there reads
+  "(current book)". Recorded history replaces the dimmed part as it builds up.
 
-The heat builds up from the moment the app starts recording: older bars stay black. FireCharts
-shows years because Material Indicators have been recording since. A REST snapshot also only
-holds the 5000 price levels nearest the price. ⓘ shows the price range the latest snapshot
-covered, and walls further away than that are not seen.
+Real history builds up from the moment the app starts recording. FireCharts shows years because
+Material Indicators have been recording since. A REST snapshot also only holds the 5000 price
+levels nearest the price, which on Binance spot BTCUSDT reaches about ±1 %. ⓘ shows the price range
+the latest snapshot covered, and walls further away than that are not seen.
 
 ### Differences from Velo's numbers
 

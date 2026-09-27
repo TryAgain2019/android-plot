@@ -183,6 +183,19 @@ class HeatmapTest {
     }
 
     @Test
+    fun currentBookIsTheLatestSnapshotInTheTimeframesBins() {
+        val h = HeatBuilder(Timeframe.H1, t("2026-09-20T00:00:00Z"))
+        assertNull(h.encodeCurrent())
+        h.add(book(t("2026-09-20T10:00:00Z"), 84_500.0, 2f, 1f))
+        h.add(book(t("2026-09-20T10:40:00Z"), 84_500.0, 3f, 1.5f))
+        val current = decode(h.encodeCurrent()!!).single()
+        assertEquals(t("2026-09-20T10:40:00Z"), current.time) // the snapshot's own time, not a bar's
+        assertEquals(84_480 / 20, current.bidTop)
+        assertEquals(HeatBuilder.code(6.0), current.bids[1]) // two $10 bins of 3 BTC, not averaged with the older snapshot
+        assertEquals(HeatBuilder.code(3.0), current.asks[1])
+    }
+
+    @Test
     fun loadsFromTheStoreAndSkipsWhatIsOutsideTheWindow() {
         val dir = tmp.newFolder("book")
         val store = BookStore(dir)

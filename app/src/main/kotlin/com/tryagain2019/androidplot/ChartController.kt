@@ -854,7 +854,8 @@ class ChartController(
             message(json {
                 str("type", "heat"); num("gen", gen); str("mode", "live")
                 raw("since", heatSince?.let { (it / 1000).toString() } ?: "null")
-                raw("data", "\"" + Base64.getEncoder().encodeToString(data) + "\"")
+                raw("data", base64(data))
+                raw("current", base64(h.encodeCurrent()))
             })
         }
     }
@@ -874,9 +875,13 @@ class ChartController(
             str("market", market.key); str("name", market.displayName)
             num("binSize", h.binSize)
             raw("since", heatSince?.let { (it / 1000).toString() } ?: "null")
-            raw("data", "\"" + Base64.getEncoder().encodeToString(data) + "\"")
+            raw("data", base64(data))
+            raw("current", base64(h.encodeCurrent()))
         })
     }
+
+    /** A JSON string of [bytes] in base64 (which needs no escaping), or null. */
+    private fun base64(bytes: ByteArray?) = if (bytes == null) "null" else "\"" + Base64.getEncoder().encodeToString(bytes) + "\""
 
     private fun bookSourceName(market: BookMarket) = "Order book (${market.displayName})"
 
@@ -970,6 +975,7 @@ class ChartController(
                     str("bg", settings.get("heat.bg") ?: "any")
                     str("lo", settings.get("heat.lo"))
                     str("hi", settings.get("heat.hi"))
+                    str("bars", settings.get("heat.bars"))
                 }
             }
         })

@@ -22,7 +22,7 @@ const fakeBridge = () => {
 
 const s21 = { viewport: { width: 411, height: 846 }, deviceScaleFactor: 2.625, isMobile: true, hasTouch: true, locale: 'en-US' };
 
-async function open(browser, { tf, price, oi, funding, heat, binSize, since }) {
+async function open(browser, { tf, price, oi, funding, heat, binSize, since, current }) {
   const page = await browser.newPage(s21);
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
@@ -37,8 +37,8 @@ async function open(browser, { tf, price, oi, funding, heat, binSize, since }) {
     app.receive({ type: 'price', gen: 1, mode: 'set', bars: msg.price });
     if (msg.oi) app.receive({ type: 'oi', gen: 1, mode: 'set', bars: msg.oi });
     if (msg.funding) app.receive({ type: 'funding', gen: 1, mode: 'set', series: msg.funding });
-    app.receive({ type: 'heat', gen: 1, mode: 'set', market: 'spot', name: 'Binance spot BTCUSDT', binSize: msg.binSize, since: msg.since, data: msg.heat });
-  }, { tf, price, oi, funding, heat, binSize, since });
+    app.receive({ type: 'heat', gen: 1, mode: 'set', market: 'spot', name: 'Binance spot BTCUSDT', binSize: msg.binSize, since: msg.since, data: msg.heat, current: msg.current });
+  }, { tf, price, oi, funding, heat, binSize, since, current: current || null });
   await page.waitForTimeout(500);
   return { page, errors };
 }
@@ -140,7 +140,62 @@ async function main() {
     await page.close();
   }
 
-  // 2. Daily chart where only the last month was recorded.
+  // 2. Recording just started: the last two bars are recorded, the 98 before show the current book, dimmed.
+  {
+    const current = makeHeat(hourly, 20, 1);
+    const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: makeHeat(hourly, 20, 2), binSize: 20, since: hourly[hourly.length - 2][0], current });
+    await page.screenshot({ path: path.join(outDir, 'heat-1h-fresh.png') });
+    const last = hourly[hourly.length - 1][4];
+    const n = hourly.length;
+    // Colour on a bar 50 bars back (current book, dimmed) vs the newest bar, both just below the price.
+    const at = (i, price) => page.evaluate(({ i, price }) => {
+      const app = window.chartApp;
+      const pane = app.chart.panes()[0];
+      const canvas = pane.getHTMLElement().querySelector('canvas');
+      const x = app.chart.timeScale().logicalToCoordinate(i);
+      const y = pane.getSeries()[0].priceToCoordinate(price);
+      const ratio = canvas.width / canvas.getBoundingClientRect().width;
+      const [r, g, b] = canvas.getContext('2d').getImageData(Math.round(x * ratio), Math.round(y * ratio), 1, 1).data;
+      return { r, g, b };
+    }, { i, price });
+    // 86,000-86,020 is a wall in the synthetic book, above the candles on these bars.
+    results.fresh = {
+      note: await page.evaluate(() => document.querySelector('.legend').textContent),
+      recorded: await at(n - 1, 86010),
+      projected: await at(n - 50, 86010),
+      beyondN: await at(n - 105, 86010),
+    };
+    // Long-press on a projected bar reads the current book.
+    const cdp = await page.context().newCDPSession(page);
+    const point = await page.evaluate(n => {
+      const app = window.chartApp;
+      const x = app.chart.timeScale().logicalToCoordinate(n - 30);
+      const y = app.chart.panes()[0].getSeries()[0].priceToCoordinate(85010);
+      const rect = app.chart.panes()[0].getHTMLElement().getBoundingClientRect();
+      return [rect.left + x, rect.top + y];
+    }, n);
+    await touch(cdp, 'touchStart', [point]);
+    await page.waitForTimeout(700);
+    await touch(cdp, 'touchMove', [[point[0] + 1, point[1]]]);
+    await page.waitForTimeout(200);
+    results.fresh.readout = await page.evaluate(() => document.querySelector('.legend').textContent);
+    await touch(cdp, 'touchEnd', []);
+    // 200 bars: the current book reaches further back; the setting is saved.
+    await page.tap('#info-btn');
+    await page.waitForTimeout(200);
+    await page.evaluate(() => document.getElementById('heat-settings').scrollIntoView());
+    await page.screenshot({ path: path.join(outDir, 'heat-sheet-bars.png') });
+    await page.evaluate(() => [...document.querySelectorAll('#heat-settings button')].find(b => b.textContent === '200').click());
+    await page.tap('#close-sheet');
+    await page.waitForTimeout(300);
+    results.fresh.after200 = await at(n - 105, 86010);
+    results.fresh.saved = await page.evaluate(() => window.__calls.filter(c => c[0] === 'setSetting' && c[1] === 'heat.bars'));
+    await page.screenshot({ path: path.join(outDir, 'heat-1h-fresh-200.png') });
+    allErrors.push(...errors);
+    await page.close();
+  }
+
+  // 3. Daily chart where only the last month was recorded.
   {
     const data = makeData();
     const { page, errors } = await open(browser, { tf: '1d', ...data, heat: makeHeat(data.price, 100, 31), binSize: 100, since: data.price[data.price.length - 31][0] });
@@ -155,7 +210,7 @@ async function main() {
     await page.close();
   }
 
-  // 3. Speed: re-rendering the visible heatmap while panning a zoomed-out hourly chart.
+  // 4. Speed: re-rendering the visible heatmap while panning a zoomed-out hourly chart.
   {
     const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: hourlyHeat, binSize: 20, since: hourly[0][0] });
     results.renderMs = await page.evaluate(async () => {
