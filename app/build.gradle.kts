@@ -16,8 +16,8 @@ plugins {
 }
 
 val applicationId = "com.tryagain2019.androidplot"
-val appVersionCode = 9
-val appVersionName = "1.6.0"
+val appVersionCode = 10
+val appVersionName = "1.6.1"
 val minSdk = 26
 val targetSdk = 34
 

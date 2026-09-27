@@ -41,6 +41,7 @@
     asks: [[0, [40, 6, 8]], [0.22, [92, 12, 14]], [0.45, [168, 26, 20]], [0.65, [226, 84, 22]], [0.82, [252, 164, 38]], [1, [255, 236, 150]]],
     bids: [[0, [4, 30, 28]], [0.22, [8, 66, 60]], [0.45, [14, 116, 100]], [0.65, [28, 172, 136]], [0.82, [84, 226, 174]], [1, [200, 255, 230]]],
     gamma: 1.6, // > 1 keeps the everyday book dark so walls stand out
+    outline: '#000000', // around the candles, so they stand out from heat of the same colours
   };
 
   // Funding lines; drawn in this order (later ones on top).
@@ -549,10 +550,55 @@
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(heatCanvas, 0, 0, lay.cols, lay.rows,
             (lay.x0 - lay.spacing / 2) * hr, yTop * vr, lay.cols * lay.gx * lay.spacing * hr, (yBottom - yTop) * vr);
+          drawCandleOutlines(scope, lay);
         });
       },
     }),
   }];
+  // Candle body width in bitmap pixels, as the library computes it (optimalCandlestickWidth and
+  // its odd/even adjustment in lightweight-charts 5.2.1), so outlines line up with the candles.
+  function candleBodyWidth(barSpacing, ratio) {
+    let width;
+    if (barSpacing >= 2.5 && barSpacing <= 4) {
+      width = Math.floor(3 * ratio);
+    } else {
+      const coeff = 1 - 0.2 * Math.atan(Math.max(4, barSpacing) - 4) / (Math.PI * 0.5);
+      width = Math.max(Math.floor(ratio), Math.min(Math.floor(barSpacing * coeff * ratio), Math.floor(barSpacing * ratio)));
+    }
+    if (width >= 2 && Math.floor(ratio) % 2 !== width % 2) width--;
+    return width;
+  }
+
+  // A black outline around every candle's body and wick, drawn under the candles (which then paint
+  // over it), so they stay visible on heat of their own colours. Thin candles keep their colour,
+  // which the library's own border option would replace.
+  function drawCandleOutlines(scope, lay) {
+    const ctx = scope.context;
+    const hr = scope.horizontalPixelRatio;
+    const vr = scope.verticalPixelRatio;
+    const ring = Math.max(1, Math.floor(hr));
+    const body = candleBodyWidth(lay.spacing, hr);
+    const wick = Math.max(Math.floor(hr), Math.min(Math.floor(hr), Math.floor(lay.spacing * hr), body));
+    const ts = chart.timeScale();
+    ctx.fillStyle = HEAT.outline;
+    for (let i = lay.i0; i <= lay.i1; i++) {
+      const b = state.price[i];
+      const x = ts.logicalToCoordinate(i);
+      const open = priceSeries.priceToCoordinate(b.open);
+      const close = priceSeries.priceToCoordinate(b.close);
+      const high = priceSeries.priceToCoordinate(b.high);
+      const low = priceSeries.priceToCoordinate(b.low);
+      if (x === null || open === null || close === null || high === null || low === null) continue;
+      const cx = Math.round(x * hr);
+      const top = Math.round(Math.min(open, close) * vr);
+      const bottom = Math.round(Math.max(open, close) * vr);
+      const hy = Math.round(high * vr);
+      const ly = Math.round(low * vr);
+      ctx.fillRect(cx - Math.floor(body * 0.5) - ring, top - ring, body + 2 * ring, bottom - top + 1 + 2 * ring);
+      ctx.fillRect(cx - Math.floor(wick * 0.5) - ring, hy - ring, wick + 2 * ring, ly - hy + 1 + 2 * ring);
+    }
+  }
+
   // The price axis beside the heatmap goes black as well (its border line stays).
   const heatAxisViews = [{
     zOrder: () => 'bottom',

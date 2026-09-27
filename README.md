@@ -109,6 +109,8 @@ do not hold is spread evenly over its $10 bins.
 - **Sensitivity**: the slider's left handle hides quantities below it, the right handle is where
   colours reach full strength. The range adapts to the timeframe's data (5th to 99.8th
   percentile). Long-press a band to read its quantity.
+- Candles get a black outline (body and wick) while the heatmap is on, so green and red candles
+  stay visible over teal and red heat.
 
 The heat builds up from the moment the app starts recording: older bars stay black. FireCharts
 shows years because Material Indicators have been recording since. A REST snapshot also only

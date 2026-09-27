@@ -73,6 +73,29 @@ async function main() {
   const hourlyHeat = makeHeat(hourly, 20);
   {
     const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: hourlyHeat, binSize: 20, since: hourly[0][0] });
+    // Candles have a black outline on the heatmap: scan right from a candle's centre at mid-body.
+    await page.screenshot({ path: path.join(outDir, 'heat-1h-outlines.png') });
+    results.outline = await page.evaluate(() => {
+      const app = window.chartApp;
+      const pane = app.chart.panes()[0];
+      const canvas = pane.getHTMLElement().querySelector('canvas');
+      const ratio = canvas.width / canvas.getBoundingClientRect().width;
+      const series = pane.getSeries()[0];
+      const n = app.state.price.length;
+      const bodyOf = i => Math.abs(app.state.price[i].close - app.state.price[i].open);
+      let best = n - 1;
+      for (let i = n - 40; i < n; i++) if (bodyOf(i) > bodyOf(best)) best = i;
+      const b = app.state.price[best];
+      const x = Math.round(app.chart.timeScale().logicalToCoordinate(best) * ratio);
+      const y = Math.round(series.priceToCoordinate((b.open + b.close) / 2) * ratio);
+      const row = canvas.getContext('2d').getImageData(x, y, 40, 1).data;
+      const px = k => [row[4 * k], row[4 * k + 1], row[4 * k + 2]].join();
+      let k = 0;
+      while (k < 40 && px(k) === px(0)) k++;
+      let ring = 0;
+      while (k + ring < 40 && px(k + ring) === '0,0,0') ring++;
+      return { candle: px(0), halfBody: k, outline: ring, beyond: px(k + ring) };
+    });
     await page.evaluate(() => window.chartApp.chart.timeScale().fitContent());
     await page.waitForTimeout(300);
     await page.screenshot({ path: path.join(outDir, 'heat-1h-16days.png') });
