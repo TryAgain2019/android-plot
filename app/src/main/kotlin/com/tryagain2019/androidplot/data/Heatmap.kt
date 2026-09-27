@@ -85,15 +85,6 @@ class HeatBuilder(val tf: Timeframe, val from: Long) {
     /** The given bars as of [now], concatenated. */
     fun encodeBars(starts: Collection<Long>, now: Long): ByteArray = concat(starts.sorted().mapNotNull { encode(it, now) })
 
-    /**
-     * The latest snapshot on its own, in the [encode] format with the snapshot's time: the book as
-     * it is now. The page shows it on bars from before the recording started.
-     */
-    fun encodeCurrent(): ByteArray? {
-        val s = last ?: return null
-        return Acc().apply { add(s, 1, factor, maxDistance) }.encode(s.time)
-    }
-
     private fun commit(s: BookSnapshot, start: Long, end: Long, changed: MutableSet<Long>) {
         var t = start
         while (t < end) {

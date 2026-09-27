@@ -10,8 +10,8 @@
  *   price   {gen, mode: set|prepend|live, bars:[[t,o,h,l,c,volume]...]}
  *   oi      {gen, mode: set|live, bars:[[t,o,h,l,c]...]}
  *   funding {gen, mode: set|live, series:{hyperliquid:[[t,v]...], okx:..., binance:..., bybit:...}}
- *   heat    {gen, mode: set|live|off, market, name, binSize, since, data, current}   order book heatmap;
- *           data is base64 of bar records (see decodeHeat), current the latest snapshot as one record
+ *   heat    {gen, mode: set|live|off, market, name, binSize, since, data}   order book heatmap; data is
+ *           base64 of bar records (see decodeHeat)
  *   busy    {gen, what: price|oi|funding, busy, detail}
  *   status  {live: ok|warn|error, sources:{key:{state, text}}}
  *   error   {gen, text}                                 shown as a banner with a retry button
@@ -35,14 +35,12 @@
   };
 
   // Order book heatmap in the style of Material Indicators' FireCharts: asks in fire colours,
-  // bids in teal, on black. Stops run from the faintest shown quantity to the strongest. Bars from
-  // before the recording started show the current book, dimmed.
+  // bids in teal, on black. Stops run from the faintest shown quantity to the strongest.
   const HEAT = {
     bg: '#0a0a0b',
     asks: [[0, [40, 6, 8]], [0.22, [92, 12, 14]], [0.45, [168, 26, 20]], [0.65, [226, 84, 22]], [0.82, [252, 164, 38]], [1, [255, 236, 150]]],
     bids: [[0, [4, 30, 28]], [0.22, [8, 66, 60]], [0.45, [14, 116, 100]], [0.65, [28, 172, 136]], [0.82, [84, 226, 174]], [1, [200, 255, 230]]],
     gamma: 1.6, // > 1 keeps the everyday book dark so walls stand out
-    dim: 0.6, // brightness of the current book on bars that were not recorded
   };
 
   // Funding lines; drawn in this order (later ones on top).
@@ -284,7 +282,7 @@
       tz: 'local',
       oi: { binance: true, bybit: true, okx: true, hyperliquid: true },
       funding: { binance: true, bybit: true, okx: true, hyperliquid: true },
-      heat: { on: true, book: 'spot', bg: 'any', lo: 0, hi: 0.8, bars: 100 },
+      heat: { on: true, book: 'spot', bg: 'any', lo: 0, hi: 0.8 },
     },
     heat: {
       market: 'spot',
@@ -292,8 +290,6 @@
       binSize: 10,
       since: null, // first recorded snapshot (UTC seconds)
       bars: new Map(), // display time -> record
-      first: Infinity, // display time of the oldest recorded bar
-      current: null, // the latest snapshot: shown on bars from before the recording started
       version: 0,
       cMin: 1, // quantity codes spanning the data (percentiles), which the sensitivity range maps onto
       cMax: 255,
@@ -338,32 +334,6 @@
     }
   }
 
-  function decodeOne(b64) {
-    const one = new Map();
-    decodeHeat(b64, one);
-    return one.size ? one.values().next().value : null;
-  }
-
-  /** How many of the newest bars get heat (a setting). */
-  function heatBarCount() {
-    return state.settings.heat.bars;
-  }
-
-  /**
-   * The heat of bar i: its recorded record, or the current book for bars among the last N that
-   * are older than the recording (projected: shown dimmed and labelled). Null for no heat.
-   */
-  function heatOfBar(i) {
-    const n = state.price.length;
-    if (i < n - heatBarCount()) return null;
-    const time = state.price[i].time;
-    const r = state.heat.bars.get(time);
-    if (r) return { r, projected: false };
-    const cur = state.heat.current;
-    if (cur && time < state.heat.first) return { r: cur, projected: true };
-    return null;
-  }
-
   function heatQuantity(code) {
     return code ? Math.pow(10, (code - 1) / 24 - 4) : 0;
   }
@@ -380,9 +350,7 @@
   function updateHeatRange() {
     const counts = new Uint32Array(256);
     let total = 0;
-    const records = [...state.heat.bars.values()];
-    if (state.heat.current) records.push(state.heat.current);
-    for (const r of records) {
+    for (const r of state.heat.bars.values()) {
       const end = r.askOff + r.askCount;
       for (let i = r.bidOff; i < end; i++) {
         const c = r.bytes[i];
@@ -422,13 +390,7 @@
   }
 
   // Colour per quantity code and side, as little-endian RGBA words for ImageData.
-  const palette = {
-    key: '',
-    asks: new Uint32Array(256),
-    bids: new Uint32Array(256),
-    dimAsks: new Uint32Array(256),
-    dimBids: new Uint32Array(256),
-  };
+  const palette = { key: '', asks: new Uint32Array(256), bids: new Uint32Array(256) };
   function heatPalette() {
     const h = state.heat;
     const s = state.settings.heat;
@@ -439,15 +401,14 @@
     const hi = Math.max(lo + 0.5, h.cMin + s.hi * (h.cMax - h.cMin));
     for (let c = 0; c < 256; c++) {
       if (c === 0 || c < lo) {
-        palette.asks[c] = palette.bids[c] = palette.dimAsks[c] = palette.dimBids[c] = 0;
+        palette.asks[c] = 0;
+        palette.bids[c] = 0;
         continue;
       }
       const t = Math.pow(Math.min(1, (c - lo) / (hi - lo)), HEAT.gamma);
-      for (const [side, dim] of [['asks', 'dimAsks'], ['bids', 'dimBids']]) {
+      for (const side of ['asks', 'bids']) {
         const [r, g, b] = stopColor(HEAT[side], t);
         palette[side][c] = ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
-        const k = HEAT.dim;
-        palette[dim][c] = ((255 << 24) | (Math.round(b * k) << 16) | (Math.round(g * k) << 8) | Math.round(r * k)) >>> 0;
       }
     }
     return palette;
@@ -461,12 +422,10 @@
   let heatKey = '';
   let heatBids = new Uint8Array(0);
   let heatAsks = new Uint8Array(0);
-  let fillBids = new Uint8Array(0); // the current book on bars from before the recording
-  let fillAsks = new Uint8Array(0);
 
   function heatLayout(mediaHeight) {
     const n = state.price.length;
-    if ((!state.heat.bars.size && !state.heat.current) || !n) return null;
+    if (!state.heat.bars.size || !n) return null;
     const ts = chart.timeScale();
     const range = ts.getVisibleLogicalRange();
     if (!range) return null;
@@ -492,8 +451,7 @@
 
   function renderHeat(lay) {
     const pal = heatPalette();
-    const n = state.price.length;
-    const key = [lay.i0, lay.i1, lay.gx, lay.g, lay.rTop, lay.rows, n, heatBarCount(), state.heat.version, pal.key, state.gen].join(',');
+    const key = [lay.i0, lay.i1, lay.gx, lay.g, lay.rTop, lay.rows, state.heat.version, pal.key, state.gen].join(',');
     if (key === heatKey) return;
     heatKey = key;
     const { i0, i1, gx, g, rTop, rows, cols } = lay;
@@ -501,20 +459,14 @@
     if (heatBids.length < cells) {
       heatBids = new Uint8Array(cells);
       heatAsks = new Uint8Array(cells);
-      fillBids = new Uint8Array(cells);
-      fillAsks = new Uint8Array(cells);
     } else {
       heatBids.fill(0, 0, cells);
       heatAsks.fill(0, 0, cells);
-      fillBids.fill(0, 0, cells);
-      fillAsks.fill(0, 0, cells);
     }
-    for (let i = Math.max(i0, n - heatBarCount()); i <= i1; i++) {
-      const heat = heatOfBar(i);
-      if (!heat) continue;
-      const r = heat.r;
-      const bidsCh = heat.projected ? fillBids : heatBids;
-      const asksCh = heat.projected ? fillAsks : heatAsks;
+    const bars = state.heat.bars;
+    for (let i = i0; i <= i1; i++) {
+      const r = bars.get(state.price[i].time);
+      if (!r) continue;
       const col = Math.floor((i - i0) / gx);
       const b = r.bytes;
       for (let j = 0; j < r.bidCount; j++) { // bins going down the price axis
@@ -524,7 +476,7 @@
         if (row < 0) continue;
         if (row >= rows) break;
         const idx = row * cols + col;
-        if (code > bidsCh[idx]) bidsCh[idx] = code;
+        if (code > heatBids[idx]) heatBids[idx] = code;
       }
       for (let j = 0; j < r.askCount; j++) { // bins going up
         const code = b[r.askOff + j];
@@ -533,7 +485,7 @@
         if (row >= rows) continue;
         if (row < 0) break;
         const idx = row * cols + col;
-        if (code > asksCh[idx]) asksCh[idx] = code;
+        if (code > heatAsks[idx]) heatAsks[idx] = code;
       }
     }
     if (heatCanvas.width !== cols || heatCanvas.height !== rows) {
@@ -546,13 +498,7 @@
     for (let idx = 0; idx < cells; idx++) {
       const a = heatAsks[idx];
       const bd = heatBids[idx];
-      if (a || bd) {
-        px[idx] = a >= bd ? pal.asks[a] : pal.bids[bd]; // the bigger side wins where price crossed
-      } else {
-        const fa = fillAsks[idx];
-        const fb = fillBids[idx];
-        px[idx] = fa >= fb ? pal.dimAsks[fa] : pal.dimBids[fb];
-      }
+      px[idx] = a >= bd ? pal.asks[a] : pal.bids[bd]; // the bigger side wins where price crossed
     }
     heatCtx.putImageData(heatImage, 0, 0);
   }
@@ -819,17 +765,16 @@
   // Liquidity under the crosshair: the average resting in that price bin while the bar was open.
   function bookHtml(time) {
     if (!heatOn() || state.hoverPrice === null) return '';
-    const i = barAt(state.price, time);
-    const heat = i >= 0 ? heatOfBar(i) : null;
-    if (!heat) return '';
+    const r = state.heat.bars.get(time);
+    if (!r) return '';
     const bin = state.heat.binSize;
     const k = Math.floor(state.hoverPrice / bin);
-    const { bid, ask } = heatCodes(heat.r, k);
+    const { bid, ask } = heatCodes(r, k);
     if (!bid && !ask) return '';
     const isAsk = ask >= bid;
     const q = heatQuantity(isAsk ? ask : bid);
     return `<br><span class="k0">${isAsk ? 'Asks' : 'Bids'}</span> <span style="color:${isAsk ? '#ff8f45' : '#3fe0b0'}">${fmtBtc(q)} BTC</span>` +
-      `<span class="muted"> at ${nfInt.format(k * bin)}–${nfInt.format((k + 1) * bin)}${heat.projected ? ' (current book)' : ''}</span>`;
+      `<span class="muted"> at ${nfInt.format(k * bin)}–${nfInt.format((k + 1) * bin)}</span>`;
   }
 
   const fmtSince = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
@@ -840,15 +785,9 @@
     const book = state.sources.book;
     if (book && book.state === 'error') return `<span class="muted">Order book: ${esc(book.text)}</span>`;
     const since = state.heat.since;
-    if (since === null) return '<span class="muted">Current order book (recording…)</span>';
-    const recorded = esc(fmtSince.format(new Date(since * 1000)));
-    const n = state.price.length;
-    const oldest = n ? state.price[Math.max(0, n - heatBarCount())].time : Infinity;
-    if (state.heat.current && oldest < state.heat.first) {
-      return `<span class="muted">Recorded since ${recorded} · dimmed: current book</span>`;
-    }
+    if (since === null) return '<span class="muted">Order book heatmap: recording…</span>';
     if (Date.now() / 1000 - since > 7 * 86400) return '';
-    return `<span class="muted">Order book recorded since ${recorded}</span>`;
+    return `<span class="muted">Order book recorded since ${esc(fmtSince.format(new Date(since * 1000)))}</span>`;
   }
 
   function legendHtml(line1, line2) {
@@ -1045,12 +984,6 @@
       call('setSetting', 'heat.book', v);
       renderHeatSettings();
     }));
-    box.appendChild(segRow('Bars with heat', [50, 100, 200, 500, 1000].map(v => [v, String(v)]), heat.bars, v => {
-      heat.bars = v;
-      applyHeatVisibility();
-      call('setSetting', 'heat.bars', String(v));
-      renderHeatSettings();
-    }));
     box.appendChild(segRow('Record while closed', [['off', 'Off'], ['wifi', 'Wi-Fi'], ['any', 'Always']], heat.bg, v => {
       heat.bg = v;
       call('setSetting', 'heat.bg', v);
@@ -1060,7 +993,6 @@
     const note = document.createElement('p');
     note.className = 'small';
     note.textContent = (since ? `Recorded since ${fmtSince.format(new Date(since * 1000))}. ` : 'Nothing recorded yet. ') +
-      'Binance keeps no order book history, so among the last bars, those from before the recording show today\'s book, dimmed. ' +
       (heat.book === 'spot'
         ? 'A spot snapshot (5000 price levels a side) is about 60 KB: roughly 4 MB an hour while the app is open, 6 MB a day while closed.'
         : 'A futures snapshot (1000 price levels a side) is about 8 KB: under 1 MB a day while closed.');
@@ -1117,8 +1049,6 @@
     state.hoverPrice = null;
     state.needInitialView = true;
     state.heat.bars = new Map();
-    state.heat.first = Infinity;
-    state.heat.current = null;
     state.heat.version++;
     priceSeries.setData([]);
     volumeSeries.setData([]);
@@ -1199,21 +1129,16 @@
     if (msg.mode === 'off') {
       state.settings.heat.on = false;
       h.bars = new Map();
-      h.current = null;
     } else {
       state.settings.heat.on = true;
       if (msg.mode === 'set') {
         h.bars = new Map();
-        h.current = null;
         h.market = msg.market || h.market;
         h.name = msg.name || h.name;
         h.binSize = msg.binSize || h.binSize;
       }
       if (msg.since !== undefined) h.since = msg.since;
       decodeHeat(msg.data, h.bars);
-      if (msg.current !== undefined) h.current = decodeOne(msg.current);
-      h.first = Infinity;
-      for (const t of h.bars.keys()) if (t < h.first) h.first = t;
       updateHeatRange();
     }
     h.version++;
@@ -1252,8 +1177,6 @@
           heat.lo = lo;
           heat.hi = hi;
         }
-        const bars = parseInt(s.heat.bars, 10);
-        if (bars > 0) heat.bars = bars;
       }
       applyFundingVisibility();
       applyHeatVisibility();

@@ -195,10 +195,6 @@ class ControllerEndToEndTest {
         assertEquals(100.0, set.getDouble("binSize"))
         waitFor("live heat") { find("heat", "live").size >= 3 }
         assertTrue(fake.requests.contains("/api/v3/depth"))
-        // Every update also carries the latest snapshot: the page shows it on bars from before the recording.
-        val current = decodeHeat(Base64.getDecoder().decode(find("heat", "live").last().getString("current"))).single()
-        assertTrue(Math.abs(current.time - System.currentTimeMillis()) < 60_000)
-        assertTrue(current.bids.isNotEmpty() && current.asks.isNotEmpty())
         assertTrue(fake.requests.none { it == "/fapi/v1/depth" })
 
         // Today's daily bar: $100 bins of the fake book, with walls at every $1000.
