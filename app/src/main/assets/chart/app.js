@@ -489,7 +489,9 @@
     if (pTop === null || pBottom === null || !(pTop > pBottom) || !(spacing > 0)) return null;
     const bin = state.heat.binSize;
     const g = Math.max(1, Math.ceil((pTop - pBottom) / mediaHeight / bin)); // bins per row, rows >= 1px
-    const rowSize = g * bin;
+    // The balance shading is continuous, so its rows are single pixels (a smooth fade without
+    // blurring bars into each other); price levels keep rows of whole bins.
+    const rowSize = balanceMode() ? (pTop - pBottom) / Math.max(1, Math.round(mediaHeight)) : g * bin;
     const rTop = Math.floor(pTop / rowSize);
     const rows = rTop - Math.floor(pBottom / rowSize) + 1;
     const gx = Math.max(1, Math.ceil(1 / spacing)); // bars per column, columns >= 1px
@@ -650,7 +652,7 @@
           renderHeat(lay);
           const hr = scope.horizontalPixelRatio;
           const vr = scope.verticalPixelRatio;
-          ctx.imageSmoothingEnabled = balanceMode(); // soft shading; crisp cells for price levels
+          ctx.imageSmoothingEnabled = false;
           ctx.drawImage(heatCanvas, 0, 0, lay.cols, lay.rows,
             (lay.x0 - lay.spacing / 2) * hr, yTop * vr, lay.cols * lay.gx * lay.spacing * hr, (yBottom - yTop) * vr);
           drawCandleOutlines(scope, lay);

@@ -163,9 +163,10 @@ async function main() {
     await page.close();
   }
 
-  // 2. Cumulative buy/sell balance: blocks of 10 bars alternate buy-heavy (bids x3, asks /3) and sell-heavy.
+  // 2. Cumulative buy/sell balance: blocks of 10 bars alternate buy-heavy (bids x10, asks /10) and
+  // sell-heavy, strong enough to outweigh the synthetic book's 85,000 sell wall.
   {
-    const skew = i => (Math.floor(i / 10) % 2 ? 1 / 3 : 3);
+    const skew = i => (Math.floor(i / 10) % 2 ? 0.1 : 10);
     const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: makeHeat(hourly, 20, hourly.length, skew), binSize: 20, since: hourly[0][0] });
     await page.tap('.heat-mode');
     await page.waitForTimeout(300);
@@ -177,21 +178,22 @@ async function main() {
       const canvas = pane.getHTMLElement().querySelector('canvas');
       const ratio = canvas.width / canvas.getBoundingClientRect().width;
       const bar = app.state.price[i];
-      const x = app.chart.timeScale().logicalToCoordinate(i) + 1.2; // beside the wick
+      const x = app.chart.timeScale().logicalToCoordinate(i);
       const y = pane.getSeries()[0].priceToCoordinate(bar.close + dy);
       const [r, g, b] = canvas.getContext('2d').getImageData(Math.round(x * ratio), Math.round(y * ratio), 1, 1).data;
       return { r, g, b };
     }, { i, dy });
-    // Pick a buy-heavy and a sell-heavy bar among the newest, and look $400 below and above the close.
-    const buyHeavy = [...Array(20).keys()].map(k => n - 1 - k).find(i => skew(i) > 1);
-    const sellHeavy = [...Array(20).keys()].map(k => n - 1 - k).find(i => skew(i) < 1);
+    // A buy-heavy and a sell-heavy bar from the middle of recent blocks; look $600 below and above
+    // the close, clear of the candles.
+    const buyHeavy = [...Array(40).keys()].map(k => n - 1 - k).find(i => skew(i) > 1 && i % 10 === 5);
+    const sellHeavy = [...Array(40).keys()].map(k => n - 1 - k).find(i => skew(i) < 1 && i % 10 === 5);
     results.balance = {
       mode: await page.evaluate(() => window.chartApp.state.settings.heat.mode),
       saved: await page.evaluate(() => window.__calls.filter(c => c[0] === 'setSetting' && c[1] === 'heat.mode')),
-      buyHeavyBelow: await colour(buyHeavy, -400),
-      buyHeavyAbove: await colour(buyHeavy, 400),
-      sellHeavyAbove: await colour(sellHeavy, 400),
-      sellHeavyBelow: await colour(sellHeavy, -400),
+      buyHeavyBelow: await colour(buyHeavy, -600),
+      buyHeavyAbove: await colour(buyHeavy, 600),
+      sellHeavyAbove: await colour(sellHeavy, 600),
+      sellHeavyBelow: await colour(sellHeavy, -600),
     };
     // Long-press reads both sides' totals.
     const cdp = await page.context().newCDPSession(page);
