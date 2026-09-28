@@ -984,6 +984,9 @@ class ChartController(
                     str("bg", settings.get("heat.bg") ?: "any")
                     str("lo", settings.get("heat.lo"))
                     str("hi", settings.get("heat.hi"))
+                    str("mode", settings.get("heat.mode"))
+                    str("blo", settings.get("heat.blo"))
+                    str("bhi", settings.get("heat.bhi"))
                 }
             }
         })

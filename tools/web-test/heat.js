@@ -163,7 +163,59 @@ async function main() {
     await page.close();
   }
 
-  // 2. Daily chart where only the last month was recorded.
+  // 2. Cumulative buy/sell balance: blocks of 10 bars alternate buy-heavy (bids x3, asks /3) and sell-heavy.
+  {
+    const skew = i => (Math.floor(i / 10) % 2 ? 1 / 3 : 3);
+    const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: makeHeat(hourly, 20, hourly.length, skew), binSize: 20, since: hourly[0][0] });
+    await page.tap('.heat-mode');
+    await page.waitForTimeout(300);
+    await page.screenshot({ path: path.join(outDir, 'heat-1h-balance.png') });
+    const n = hourly.length;
+    const colour = (i, dy) => page.evaluate(({ i, dy }) => {
+      const app = window.chartApp;
+      const pane = app.chart.panes()[0];
+      const canvas = pane.getHTMLElement().querySelector('canvas');
+      const ratio = canvas.width / canvas.getBoundingClientRect().width;
+      const bar = app.state.price[i];
+      const x = app.chart.timeScale().logicalToCoordinate(i) + 1.2; // beside the wick
+      const y = pane.getSeries()[0].priceToCoordinate(bar.close + dy);
+      const [r, g, b] = canvas.getContext('2d').getImageData(Math.round(x * ratio), Math.round(y * ratio), 1, 1).data;
+      return { r, g, b };
+    }, { i, dy });
+    // Pick a buy-heavy and a sell-heavy bar among the newest, and look $400 below and above the close.
+    const buyHeavy = [...Array(20).keys()].map(k => n - 1 - k).find(i => skew(i) > 1);
+    const sellHeavy = [...Array(20).keys()].map(k => n - 1 - k).find(i => skew(i) < 1);
+    results.balance = {
+      mode: await page.evaluate(() => window.chartApp.state.settings.heat.mode),
+      saved: await page.evaluate(() => window.__calls.filter(c => c[0] === 'setSetting' && c[1] === 'heat.mode')),
+      buyHeavyBelow: await colour(buyHeavy, -400),
+      buyHeavyAbove: await colour(buyHeavy, 400),
+      sellHeavyAbove: await colour(sellHeavy, 400),
+      sellHeavyBelow: await colour(sellHeavy, -400),
+    };
+    // Long-press reads both sides' totals.
+    const cdp = await page.context().newCDPSession(page);
+    const point = await page.evaluate(i => {
+      const app = window.chartApp;
+      const x = app.chart.timeScale().logicalToCoordinate(i);
+      const y = app.chart.panes()[0].getSeries()[0].priceToCoordinate(app.state.price[i].close);
+      const rect = app.chart.panes()[0].getHTMLElement().getBoundingClientRect();
+      return [rect.left + x, rect.top + y];
+    }, buyHeavy);
+    await touch(cdp, 'touchStart', [point]);
+    await page.waitForTimeout(700);
+    await touch(cdp, 'touchMove', [[point[0] + 1, point[1]]]);
+    await page.waitForTimeout(200);
+    results.balance.readout = await page.evaluate(() => document.querySelector('.legend').textContent);
+    await touch(cdp, 'touchEnd', []);
+    // And back to price levels.
+    await page.tap('.heat-mode');
+    results.balance.back = await page.evaluate(() => window.chartApp.state.settings.heat.mode);
+    allErrors.push(...errors);
+    await page.close();
+  }
+
+  // 3. Daily chart where only the last month was recorded.
   {
     const data = makeData();
     const { page, errors } = await open(browser, { tf: '1d', ...data, heat: makeHeat(data.price, 100, 31), binSize: 100, since: data.price[data.price.length - 31][0] });
@@ -178,7 +230,7 @@ async function main() {
     await page.close();
   }
 
-  // 3. Speed: re-rendering the visible heatmap while panning a zoomed-out hourly chart.
+  // 4. Speed: re-rendering the visible heatmap while panning a zoomed-out hourly chart.
   {
     const { page, errors } = await open(browser, { tf: '1h', price: hourly, heat: hourlyHeat, binSize: 20, since: hourly[0][0] });
     results.renderMs = await page.evaluate(async () => {

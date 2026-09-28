@@ -86,6 +86,11 @@
     position: absolute; top: 4px; width: 4px; height: 14px; margin-left: -2px; border-radius: 1.5px;
     background: #e6e6e6; box-shadow: 0 0 0 1px rgba(0, 0, 0, .6);
   }
+  .heat-mode {
+    margin-left: 2px; padding: 3px 5px; border: 1px solid #444; border-radius: 3px; background: transparent;
+    font: 600 8.5px/1 "Roboto Mono", "Droid Sans Mono", monospace; letter-spacing: .5px; color: #8a8f98;
+  }
+  .heat-mode.on { color: #e8eaed; border-color: #34de96; background: rgba(52, 222, 150, .16); }
 
   #realtime {
     position: absolute; right: 70px; bottom: 34px; z-index: 4; display: none;
@@ -184,7 +189,9 @@
       futures), Bybit, OKX and Hyperliquid itself, every minute while open and about every 15 minutes
       while closed, and adds together the ones switched on above. Bars before the recording started
       have no heat. Each bar shows the average quantity resting in each price band while the bar was
-      open. Long-press to read it.</p>
+      open. Long-press to read it. With <b>Cumulative</b> on, each bar instead compares all resting buy
+      orders with all sell orders: green under the price when buys outweigh sells, orange above it when
+      sells outweigh buys.</p>
 
     <h3>About</h3>
     <p class="small">Charts: TradingView Lightweight Charts&trade; v5.2.1, Copyright &copy; 2026 TradingView, Inc.,

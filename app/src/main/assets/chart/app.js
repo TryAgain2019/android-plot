@@ -42,6 +42,10 @@
     bids: [[0, [4, 30, 28]], [0.22, [8, 66, 60]], [0.45, [14, 116, 100]], [0.65, [28, 172, 136]], [0.82, [84, 226, 174]], [1, [200, 255, 230]]],
     gamma: 1.6, // > 1 keeps the everyday book dark so walls stand out
     outline: '#000000', // around the candles, so they stand out from heat of the same colours
+    // Buy/sell balance mode: shade under the price when bids outweigh asks, above when asks do.
+    balanceBids: [52, 222, 150],
+    balanceAsks: [246, 106, 34],
+    balanceAlpha: 0.85,
   };
 
   // Funding lines; drawn in this order (later ones on top).
@@ -298,6 +302,9 @@
         bg: 'any',
         lo: 0,
         hi: 0.8,
+        mode: 'levels', // or 'balance': cumulative buys vs sells
+        blo: 0, // the sensitivity handles of the balance mode
+        bhi: 0.8,
       },
     },
     heat: {
@@ -307,6 +314,7 @@
       version: 0,
       cMin: 1, // quantity codes spanning the data (percentiles), which the sensitivity range maps onto
       cMax: 255,
+      balanceMax: 1, // largest usual |balance| (98th percentile), which the balance sensitivity maps onto
     },
     sources: {},
   };
@@ -335,6 +343,10 @@
       const askCount = dv.getUint16(p + 14, true);
       const off = p + 16;
       if (off + bidCount + askCount > bytes.length) break;
+      let bidSum = 0;
+      let askSum = 0;
+      for (let i = off; i < off + bidCount; i++) bidSum += QUANTITY[bytes[i]];
+      for (let i = off + bidCount; i < off + bidCount + askCount; i++) askSum += QUANTITY[bytes[i]];
       into.set(dv.getUint32(p, true) + state.shift, {
         bidTop: dv.getInt32(p + 4, true),
         bidCount,
@@ -343,6 +355,8 @@
         bytes,
         bidOff: off,
         askOff: off + bidCount,
+        bidSum, // BTC resting on each side, summed over the price bins
+        askSum,
       });
       p = off + bidCount + askCount;
     }
@@ -350,6 +364,24 @@
 
   function heatQuantity(code) {
     return code ? Math.pow(10, (code - 1) / 24 - 4) : 0;
+  }
+
+  const QUANTITY = Float64Array.from({ length: 256 }, (_, c) => heatQuantity(c));
+
+  function balanceMode() {
+    return state.settings.heat.mode === 'balance';
+  }
+
+  /** (bids - asks) / (bids + asks) of a bar: +1 all bids, -1 all asks. */
+  function balanceOf(r) {
+    const total = r.bidSum + r.askSum;
+    return total > 0 ? (r.bidSum - r.askSum) / total : 0;
+  }
+
+  /** The sensitivity handles of the current mode. */
+  function sensitivity() {
+    const s = state.settings.heat;
+    return balanceMode() ? { lo: s.blo, hi: s.bhi } : { lo: s.lo, hi: s.hi };
   }
 
   /** Bid and ask codes of bin k in a bar record. */
@@ -374,6 +406,8 @@
         }
       }
     }
+    const balances = [...state.heat.bars.values()].map(r => Math.abs(balanceOf(r))).sort((a, b) => a - b);
+    state.heat.balanceMax = balances.length ? Math.max(0.02, balances[Math.floor((balances.length - 1) * 0.98)]) : 1;
     if (!total) {
       state.heat.cMin = 1;
       state.heat.cMax = 255;
@@ -465,11 +499,24 @@
 
   function renderHeat(lay) {
     const pal = heatPalette();
-    const key = [lay.i0, lay.i1, lay.gx, lay.g, lay.rTop, lay.rows, state.heat.version, pal.key, state.gen].join(',');
+    const s = state.settings.heat;
+    const key = [lay.i0, lay.i1, lay.gx, lay.g, lay.rTop, lay.rows, state.heat.version, pal.key, state.gen,
+      s.mode, s.blo, s.bhi, state.heat.balanceMax].join(',');
     if (key === heatKey) return;
     heatKey = key;
     const { i0, i1, gx, g, rTop, rows, cols } = lay;
     const cells = cols * rows;
+    if (heatCanvas.width !== cols || heatCanvas.height !== rows) {
+      heatCanvas.width = cols;
+      heatCanvas.height = rows;
+      heatImage = null;
+    }
+    if (!heatImage) heatImage = heatCtx.createImageData(cols, rows);
+    if (balanceMode()) {
+      renderBalance(lay, new Uint32Array(heatImage.data.buffer));
+      heatCtx.putImageData(heatImage, 0, 0);
+      return;
+    }
     if (heatBids.length < cells) {
       heatBids = new Uint8Array(cells);
       heatAsks = new Uint8Array(cells);
@@ -502,12 +549,6 @@
         if (code > heatAsks[idx]) heatAsks[idx] = code;
       }
     }
-    if (heatCanvas.width !== cols || heatCanvas.height !== rows) {
-      heatCanvas.width = cols;
-      heatCanvas.height = rows;
-      heatImage = null;
-    }
-    if (!heatImage) heatImage = heatCtx.createImageData(cols, rows);
     const px = new Uint32Array(heatImage.data.buffer);
     for (let idx = 0; idx < cells; idx++) {
       const a = heatAsks[idx];
@@ -515,6 +556,68 @@
       px[idx] = a >= bd ? pal.asks[a] : pal.bids[bd]; // the bigger side wins where price crossed
     }
     heatCtx.putImageData(heatImage, 0, 0);
+  }
+
+  let bidShade = new Uint8Array(0);
+  let askShade = new Uint8Array(0);
+
+  /**
+   * Buy/sell balance: per bar, all bids against all asks of the selected books. Where bids outweigh
+   * asks the column is shaded green from the close down to the lowest bid the books reached, where
+   * asks outweigh bids orange from the close up to the highest ask; strongest at the price, fading
+   * away from it, and stronger the bigger the imbalance.
+   */
+  function renderBalance(lay, px) {
+    const { i0, i1, gx, rTop, rows, cols, rowSize } = lay;
+    const cells = cols * rows;
+    if (bidShade.length < cells) {
+      bidShade = new Uint8Array(cells);
+      askShade = new Uint8Array(cells);
+    } else {
+      bidShade.fill(0, 0, cells);
+      askShade.fill(0, 0, cells);
+    }
+    const bin = state.heat.binSize;
+    const { lo, hi } = sensitivity();
+    const from = lo * state.heat.balanceMax;
+    const full = Math.max(from + 1e-6, hi * state.heat.balanceMax);
+    for (let i = i0; i <= i1; i++) {
+      const bar = state.price[i];
+      const r = state.heat.bars.get(bar.time);
+      if (!r) continue;
+      const balance = balanceOf(r);
+      const t = Math.min(1, Math.max(0, (Math.abs(balance) - from) / (full - from)));
+      if (t <= 0) continue;
+      const col = Math.floor((i - i0) / gx);
+      const priceRow = rTop - Math.floor(bar.close / rowSize);
+      const bids = balance > 0;
+      const edge = bids ? (r.bidTop - r.bidCount + 1) * bin : (r.askBottom + r.askCount) * bin;
+      const edgeRow = rTop - Math.floor(edge / rowSize);
+      const span = Math.max(1, Math.abs(edgeRow - priceRow));
+      const step = bids ? 1 : -1;
+      const shade = bids ? bidShade : askShade;
+      for (let d = 0; d <= span; d++) {
+        const row = priceRow + d * step;
+        if (row < 0 || row >= rows) continue;
+        const a = Math.round(255 * t * (1 - d / (span + 1)));
+        const idx = row * cols + col;
+        if (a > shade[idx]) shade[idx] = a;
+      }
+    }
+    const [br, bg, bb] = HEAT.balanceBids;
+    const [ar, ag, ab] = HEAT.balanceAsks;
+    const k = HEAT.balanceAlpha;
+    for (let idx = 0; idx < cells; idx++) {
+      const b = bidShade[idx];
+      const a = askShade[idx];
+      if (!b && !a) {
+        px[idx] = 0;
+      } else if (b >= a) {
+        px[idx] = ((Math.round(b * k) << 24) | (bb << 16) | (bg << 8) | br) >>> 0;
+      } else {
+        px[idx] = ((Math.round(a * k) << 24) | (ab << 16) | (ag << 8) | ar) >>> 0;
+      }
+    }
   }
 
   let requestChartUpdate = () => {};
@@ -547,7 +650,7 @@
           renderHeat(lay);
           const hr = scope.horizontalPixelRatio;
           const vr = scope.verticalPixelRatio;
-          ctx.imageSmoothingEnabled = false;
+          ctx.imageSmoothingEnabled = balanceMode(); // soft shading; crisp cells for price levels
           ctx.drawImage(heatCanvas, 0, 0, lay.cols, lay.rows,
             (lay.x0 - lay.spacing / 2) * hr, yTop * vr, lay.cols * lay.gx * lay.spacing * hr, (yBottom - yTop) * vr);
           drawCandleOutlines(scope, lay);
@@ -672,13 +775,25 @@
     return el;
   });
 
-  // Sensitivity of the heatmap: the left handle hides quantities below it, the right one is where
-  // colours reach full strength.
+  // Sensitivity of the heatmap: the left handle hides quantities (or imbalances) below it, the right
+  // one is where colours reach full strength. CUMULATIVE switches to the buy/sell balance.
   const heatCtl = document.createElement('div');
   heatCtl.className = 'heat-ctl';
   heatCtl.innerHTML = '<span class="heat-lbl">SENSITIVITY</span><div class="heat-track"><div class="heat-grad"></div>' +
-    '<div class="heat-dim lo"></div><div class="heat-dim hi"></div><div class="heat-h lo"></div><div class="heat-h hi"></div></div>';
+    '<div class="heat-dim lo"></div><div class="heat-dim hi"></div><div class="heat-h lo"></div><div class="heat-h hi"></div></div>' +
+    '<button class="heat-mode" aria-label="Cumulative buys vs sells">CUMULATIVE</button>';
   const heatTrack = heatCtl.querySelector('.heat-track');
+  const heatModeBtn = heatCtl.querySelector('.heat-mode');
+
+  function setHeatMode(mode) {
+    state.settings.heat.mode = mode;
+    applyHeatVisibility();
+    call('setSetting', 'heat.mode', mode);
+  }
+  heatModeBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    setHeatMode(balanceMode() ? 'levels' : 'balance');
+  });
 
   // The price pane's legend and the slider stack in one box.
   const priceBox = document.createElement('div');
@@ -687,8 +802,9 @@
   priceBox.appendChild(heatCtl);
 
   function renderSlider() {
-    const { lo, hi } = state.settings.heat;
+    const { lo, hi } = sensitivity();
     heatCtl.style.display = heatOn() ? '' : 'none';
+    heatModeBtn.classList.toggle('on', balanceMode());
     heatCtl.querySelector('.heat-h.lo').style.left = lo * 100 + '%';
     heatCtl.querySelector('.heat-h.hi').style.left = hi * 100 + '%';
     heatCtl.querySelector('.heat-dim.lo').style.width = lo * 100 + '%';
@@ -702,16 +818,18 @@
   }
   function moveSlider(v) {
     const s = state.settings.heat;
-    if (dragging === 'lo') s.lo = Math.max(0, Math.min(v, s.hi - 0.05));
-    else s.hi = Math.min(1, Math.max(v, s.lo + 0.05));
+    const [loKey, hiKey] = balanceMode() ? ['blo', 'bhi'] : ['lo', 'hi'];
+    if (dragging === 'lo') s[loKey] = Math.max(0, Math.min(v, s[hiKey] - 0.05));
+    else s[hiKey] = Math.min(1, Math.max(v, s[loKey] + 0.05));
     renderSlider();
     requestChartUpdate();
   }
   heatCtl.addEventListener('pointerdown', e => {
+    if (e.target === heatModeBtn) return; // a tap on the switch, not a drag
     e.preventDefault();
     e.stopPropagation();
     const v = sliderValue(e);
-    const { lo, hi } = state.settings.heat;
+    const { lo, hi } = sensitivity();
     dragging = v < lo || (v <= hi && v - lo < hi - v) ? 'lo' : 'hi';
     try {
       heatCtl.setPointerCapture(e.pointerId);
@@ -726,8 +844,10 @@
   function endDrag() {
     if (!dragging) return;
     dragging = null;
-    call('setSetting', 'heat.lo', state.settings.heat.lo.toFixed(3));
-    call('setSetting', 'heat.hi', state.settings.heat.hi.toFixed(3));
+    const { lo, hi } = sensitivity();
+    const prefix = balanceMode() ? 'heat.b' : 'heat.';
+    call('setSetting', prefix + 'lo', lo.toFixed(3));
+    call('setSetting', prefix + 'hi', hi.toFixed(3));
   }
   heatCtl.addEventListener('pointerup', endDrag);
   heatCtl.addEventListener('pointercancel', endDrag);
@@ -823,9 +943,18 @@
 
   // Liquidity under the crosshair: the average resting in that price bin while the bar was open.
   function bookHtml(time) {
-    if (!heatOn() || state.hoverPrice === null) return '';
+    if (!heatOn()) return '';
     const r = state.heat.bars.get(time);
     if (!r) return '';
+    if (balanceMode()) {
+      // All bids against all asks of the selected books while the bar was open.
+      const balance = balanceOf(r);
+      const lead = balance >= 0 ? 'bids' : 'asks';
+      return `<br><span class="k0">Bids</span> <span style="color:#3fe0b0">${fmtBtc(r.bidSum)}</span>` +
+        `<span class="k">Asks</span> <span style="color:#ff8f45">${fmtBtc(r.askSum)} BTC</span>` +
+        `<span class="muted"> · ${lead} +${Math.round(Math.abs(balance) * 100)}%</span>`;
+    }
+    if (state.hoverPrice === null) return '';
     const bin = state.heat.binSize;
     const k = Math.floor(state.hoverPrice / bin);
     const { bid, ask } = heatCodes(r, k);
@@ -1036,6 +1165,16 @@
     });
     box.appendChild(toggle);
     if (!heat.on) return;
+    box.appendChild(toggleRow('Cumulative: buys vs sells', 'linear-gradient(180deg, #f66a22 50%, #34de96 50%)', balanceMode(), on => {
+      setHeatMode(on ? 'balance' : 'levels');
+      renderHeatSettings();
+    }));
+    const modeNote = document.createElement('p');
+    modeNote.className = 'small';
+    modeNote.textContent = 'Instead of price levels, each bar compares all resting buy orders with all sell orders of the ' +
+      'books below: green under the price when buys outweigh sells, orange above it when sells outweigh buys, stronger ' +
+      'the bigger the difference. Also switched by CUMULATIVE next to the sensitivity slider.';
+    box.appendChild(modeNote);
     const label = document.createElement('p');
     label.className = 'small';
     label.textContent = 'Order books added together (each exchange is recorded on its own):';
@@ -1243,6 +1382,13 @@
           heat.lo = lo;
           heat.hi = hi;
         }
+        const blo = parseFloat(s.heat.blo);
+        const bhi = parseFloat(s.heat.bhi);
+        if (blo >= 0 && bhi <= 1 && blo < bhi) {
+          heat.blo = blo;
+          heat.bhi = bhi;
+        }
+        heat.mode = s.heat.mode === 'balance' ? 'balance' : 'levels';
       }
       applyFundingVisibility();
       applyHeatVisibility();

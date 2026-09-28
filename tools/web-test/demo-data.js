@@ -107,7 +107,8 @@ function makeHourly(hours = 384, end = Date.UTC(2026, 8, 21, 12) / 1000) {
 // Order book heat in the page's binary format (decodeHeat in app.js) for the last `recorded`
 // bars: a floor of small orders that thins out away from the price, walls at round numbers, a few
 // walls that come and go, and a big (spoof-like) ask wall at 85,000 over the last days.
-function makeHeat(price, binSize, recorded = price.length) {
+// `skew(i)` (optional) multiplies bar i's bids and divides its asks, e.g. 3 for a buy-heavy book.
+function makeHeat(price, binSize, recorded = price.length, skew = null) {
   const rnd = mulberry32(99);
   const code = q => (q >= 1e-7 ? Math.max(1, Math.min(255, Math.round((Math.log10(q) + 4) * 24) + 1)) : 0);
   const movers = [];
@@ -141,8 +142,9 @@ function makeHeat(price, binSize, recorded = price.length) {
       if (side === 'ask' && i >= price.length - 100 && Math.abs(p - 85000) < binSize / 2 + 1) q += 450;
       return q;
     };
-    for (let j = 0; j < bidCount; j++) buf[16 + j] = code(qAt((bidTop - j) * binSize, 'bid'));
-    for (let j = 0; j < askCount; j++) buf[16 + bidCount + j] = code(qAt((askBottom + j) * binSize, 'ask'));
+    const k = skew ? skew(i) : 1;
+    for (let j = 0; j < bidCount; j++) buf[16 + j] = code(qAt((bidTop - j) * binSize, 'bid') * k);
+    for (let j = 0; j < askCount; j++) buf[16 + bidCount + j] = code(qAt((askBottom + j) * binSize, 'ask') / k);
     chunks.push(buf);
   }
   const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));

@@ -111,6 +111,14 @@ do not hold is spread evenly over its $10 bins.
   percentile). Long-press a band to read its quantity.
 - Candles get a black outline (body and wick) while the heatmap is on, so green and red candles
   stay visible over teal and red heat.
+- **Cumulative (buys vs sells)**: a switch (ⓘ, or `CUMULATIVE` next to the slider) that replaces
+  the price levels with the balance of the whole book. Per bar, all resting buy orders (bids) of the
+  selected books are added up and compared with all sell orders (asks), each averaged over the bar.
+  When bids outweigh asks, the bar is shaded green from the close down to the lowest bid the books
+  reached; when asks outweigh bids, orange from the close up to the highest ask. The shade is
+  strongest at the price and fades away from it. Its strength follows the imbalance
+  (bids − asks) / (bids + asks), scaled by the sensitivity slider to the 98th percentile of the
+  loaded bars. Long-press shows both totals ("Bids 1,240 Asks 980 BTC · bids +12%").
 
 The heat builds up from the moment the app starts recording: older bars stay black. FireCharts
 shows years because Material Indicators have been recording since. A REST snapshot also only
